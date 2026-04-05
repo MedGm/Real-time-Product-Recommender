@@ -1,0 +1,25 @@
+# Dataset (too large for git)
+dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Docker volumes / model artifacts
+spark/model/
+model/
+
+# Logs
+*.log
+airflow/logs/
+
+# IDE / Claude
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
