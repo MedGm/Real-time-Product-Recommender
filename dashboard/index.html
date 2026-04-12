@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Real-Time Product Recommender · Big Data Dashboard</title>
+  <meta name="description" content="Real-time product recommendation system powered by Apache Kafka, Spark ALS, and the Amazon Fine Food Reviews dataset."/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:        #0a0c10;
+      --bg2:       #0f1218;
+      --bg3:       #161c26;
+      --border:    #1e2a38;
+      --border2:   #243040;
+      --amber:     #f59e0b;
+      --amber2:    #fbbf24;
+      --teal:      #14b8a6;
+      --teal2:     #2dd4bf;
+      --red:       #ef4444;
+      --green:     #22c55e;
+      --text:      #e2e8f0;
+      --text2:     #94a3b8;
+      --text3:     #475569;
+      --mono:      'Space Mono', monospace;
+      --sans:      'DM Sans', sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      overflow-x: hidden;
+    }
+
+    /* ── Scanlines overlay ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,.03) 2px, rgba(0,0,0,.03) 4px);
+      pointer-events: none; z-index: 9999;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      width: 240px; min-height: 100vh;
+      background: var(--bg2);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      position: fixed; left: 0; top: 0; bottom: 0;
+      z-index: 100;
+    }
+    .sidebar-brand {
+      padding: 24px 20px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand-badge {
+      font-family: var(--mono);
+      font-size: 9px; font-weight: 700;
+      letter-spacing: 3px; text-transform: uppercase;
+      color: var(--amber); margin-bottom: 6px;
+    }
+    .brand-title {
+      font-size: 15px; font-weight: 700;
+      color: var(--text); line-height: 1.3;
+    }
+    .brand-sub {
+      font-size: 11px; color: var(--text3);
+      margin-top: 4px; font-family: var(--mono);
+    }
+    .nav { padding: 16px 12px; flex: 1; }
+    .nav-section { font-family: var(--mono); font-size: 9px; letter-spacing: 2px;
+      color: var(--text3); text-transform: uppercase; padding: 0 8px; margin: 16px 0 6px; }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 12px; border-radius: 6px; cursor: pointer;
+      font-size: 13px; font-weight: 500; color: var(--text2);
+      transition: all .15s ease; margin-bottom: 2px;
+      border: 1px solid transparent;
+    }
+    .nav-item:hover { background: var(--bg3); color: var(--text); }
+    .nav-item.active {
+      background: rgba(245,158,11,.1);
+      color: var(--amber);
+      border-color: rgba(245,158,11,.2);
+    }
+    .nav-icon { font-size: 16px; width: 22px; text-align: center; }
+    .sidebar-status {
+      padding: 16px 20px;
+      border-top: 1px solid var(--border);
+    }
+    .status-dot {
+      display: inline-block; width: 7px; height: 7px;
+      border-radius: 50%; margin-right: 6px;
+      background: var(--text3);
+    }
+    .status-dot.online  { background: var(--green); box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; }
+    .status-dot.offline { background: var(--red); }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+    .status-label { font-size: 12px; font-family: var(--mono); color: var(--text2); }
+
+    /* ── Main content ── */
+    .main {
+      margin-left: 240px;
+      flex: 1;
+      min-height: 100vh;
+    }
+    .page { display: none; padding: 0; }
+    .page.active { display: block; animation: fadeIn .25s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+
+    /* ── Page header ── */
+    .page-header {
+      padding: 36px 40px 28px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, var(--bg2) 0%, var(--bg) 100%);
+    }
+    .page-tag {
+      font-family: var(--mono); font-size: 10px;
+      letter-spacing: 3px; text-transform: uppercase;
+      color: var(--teal); margin-bottom: 8px;
+    }
+    .page-title { font-size: 26px; font-weight: 700; color: var(--text); }
+    .page-desc  { font-size: 14px; color: var(--text2); margin-top: 6px; }
+
+    /* ── Content area ── */
+    .content { padding: 32px 40px; }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      transition: border-color .2s;
+    }
+    .card:hover { border-color: var(--border2); }
+    .card-title {
+      font-family: var(--mono); font-size: 10px;
+      letter-spacing: 2px; text-transform: uppercase;
+      color: var(--text3); margin-bottom: 14px;
+    }
+
+    /* ── Metric grid ── */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px; margin-bottom: 28px;
+    }
+    .metric-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 22px 20px;
+      position: relative; overflow: hidden;
+    }
+    .metric-card::before {
+      content: '';
+      position: absolute; top: 0; left: 0; right: 0; height: 2px;
+      background: linear-gradient(90deg, var(--amber), var(--teal));
+    }
+    .metric-value {
+      font-family: var(--mono);
+      font-size: 28px; font-weight: 700;
+      color: var(--text);
+      line-height: 1; margin-bottom: 6px;
+      display: flex; align-items: baseline; gap: 4px;
+    }
+    .metric-value small { font-size: 14px; color: var(--text2); }
+    .metric-label {
+      font-size: 12px; color: var(--text3);
+      font-weight: 500; text-transform: uppercase; letter-spacing: .5px;
+    }
+
+    /* ── Pipeline flow ── */
+    .pipeline {
+      display: flex; align-items: center;
+      gap: 0; margin-bottom: 28px;
+      overflow-x: auto; padding-bottom: 4px;
+    }
+    .pipe-step {
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px 18px;
+      text-align: center; min-width: 110px; flex-shrink: 0;
+      position: relative;
+    }
+    .pipe-step.ready { border-color: rgba(20,184,166,.4); background: rgba(20,184,166,.05); }
+    .pipe-icon { font-size: 22px; margin-bottom: 6px; }
+    .pipe-name { font-size: 12px; font-weight: 600; color: var(--text); }
+    .pipe-desc { font-size: 10px; color: var(--text3); margin-top: 2px; font-family: var(--mono); }
+    .pipe-arrow {
+      width: 32px; flex-shrink: 0; text-align: center;
+      color: var(--border2); font-size: 18px;
+    }
+    .pipe-step .pipe-status {
+      position: absolute; top: -6px; right: -6px;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--text3);
+      border: 2px solid var(--bg);
+      font-size: 8px; display: flex; align-items: center; justify-content: center;
+    }
+    .pipe-step.ready .pipe-status { background: var(--green); }
+
+    /* ── Grid layouts ── */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 28px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 20px; margin-bottom: 28px; }
+
+    /* ── Recommendation search ── */
+    .search-bar {
+      display: flex; gap: 12px; margin-bottom: 24px; align-items: stretch;
+    }
+    .input-wrap { flex: 1; position: relative; }
+    .input-wrap input {
+      width: 100%; padding: 12px 16px;
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text);
+      font-family: var(--mono); font-size: 13px;
+      outline: none; transition: border-color .2s;
+    }
+    .input-wrap input:focus { border-color: var(--amber); }
+    .input-wrap input::placeholder { color: var(--text3); }
+    .btn {
+      padding: 12px 20px; border-radius: 8px; border: none; cursor: pointer;
+      font-family: var(--sans); font-size: 13px; font-weight: 600;
+      transition: all .15s ease; white-space: nowrap;
+    }
+    .btn-primary {
+      background: var(--amber); color: #0a0c10;
+    }
+    .btn-primary:hover { background: var(--amber2); transform: translateY(-1px); }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+    .btn-ghost {
+      background: var(--bg3); color: var(--text2);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { background: var(--border); color: var(--text); }
+
+    /* ── Rec cards ── */
+    .rec-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+    }
+    .rec-card {
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px;
+      display: flex; align-items: flex-start; gap: 14px;
+      transition: all .2s ease;
+      animation: slideInUp .3s ease both;
+    }
+    .rec-card:hover { border-color: var(--amber); transform: translateY(-2px); }
+    @keyframes slideInUp { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+    .rec-rank {
+      font-family: var(--mono); font-size: 11px;
+      color: var(--amber); min-width: 28px; padding-top: 2px;
+    }
+    .rec-body { flex: 1; min-width: 0; }
+    .rec-product {
+      font-family: var(--mono); font-size: 12px;
+      color: var(--teal2); word-break: break-all;
+      margin-bottom: 4px;
+    }
+    .rec-rating { font-size: 11px; color: var(--text3); }
+    .stars { color: var(--amber); font-size: 12px; }
+
+    /* ── Users table ── */
+    .user-list {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;
+    }
+    .user-chip {
+      font-family: var(--mono); font-size: 11px;
+      padding: 5px 10px; border-radius: 20px;
+      background: var(--bg3); border: 1px solid var(--border);
+      color: var(--text2); cursor: pointer;
+      transition: all .15s ease;
+    }
+    .user-chip:hover { background: rgba(245,158,11,.1); border-color: var(--amber); color: var(--amber); }
+
+    /* ── Params table ── */
+    .param-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 0; border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .param-row:last-child { border-bottom: none; }
+    .param-key { color: var(--text2); font-family: var(--mono); font-size: 12px; }
+    .param-val { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--teal2); }
+
+    /* ── Info banner ── */
+    .banner {
+      border-radius: 8px; padding: 14px 18px;
+      font-size: 13px; margin-bottom: 20px;
+      display: flex; align-items: center; gap: 12px;
+    }
+    .banner.info {
+      background: rgba(20,184,166,.08); border: 1px solid rgba(20,184,166,.2);
+      color: var(--teal2);
+    }
+    .banner.warn {
+      background: rgba(245,158,11,.08); border: 1px solid rgba(245,158,11,.2);
+      color: var(--amber2);
+    }
+    .banner.error {
+      background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.2);
+      color: #fca5a5;
+    }
+
+    /* ── Auto-refresh badge ── */
+    .refresh-bar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 40px;
+      background: var(--bg2); border-bottom: 1px solid var(--border);
+      font-size: 12px; color: var(--text3);
+    }
+    .refresh-toggle {
+      display: flex; align-items: center; gap: 8px; cursor: pointer;
+    }
+    .toggle-switch {
+      width: 34px; height: 18px; border-radius: 9px;
+      background: var(--bg3); border: 1px solid var(--border);
+      position: relative; transition: background .2s;
+      cursor: pointer;
+    }
+    .toggle-switch.on { background: var(--amber); border-color: var(--amber); }
+    .toggle-switch::after {
+      content: ''; position: absolute;
+      top: 2px; left: 2px; width: 12px; height: 12px;
+      border-radius: 50%; background: white; transition: left .2s;
+    }
+    .toggle-switch.on::after { left: 18px; }
+    .countdown { font-family: var(--mono); color: var(--amber); min-width: 24px; }
+
+    /* ── Divider ── */
+    .divider { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+
+    /* ── Loading spinner ── */
+    .spinner {
+      width: 20px; height: 20px;
+      border: 2px solid var(--border);
+      border-top-color: var(--amber);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loading-row { display: flex; align-items: center; gap: 10px; color: var(--text2); font-size: 13px; }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      .sidebar { width: 60px; }
+      .sidebar .brand-title, .sidebar .brand-sub, .sidebar .brand-badge,
+      .sidebar .nav-section, .sidebar .nav-item span, .sidebar-status .status-label { display: none; }
+      .main { margin-left: 60px; }
+      .metrics-grid { grid-template-columns: 1fr 1fr; }
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+      .content { padding: 20px; }
+      .page-header { padding: 20px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══ SIDEBAR ════════════════════════════════════════════════════════════ -->
+<nav class="sidebar" id="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-badge">Big Data · M2</div>
+    <div class="brand-title">Product Recommender</div>
+    <div class="brand-sub">ALS · Kafka · Spark</div>
+  </div>
+  <div class="nav">
+    <div class="nav-section">Navigation</div>
+    <div class="nav-item active" onclick="showPage('overview')" id="nav-overview">
+      <span class="nav-icon">⬡</span><span>Overview</span>
+    </div>
+    <div class="nav-item" onclick="showPage('recommendations')" id="nav-recommendations">
+      <span class="nav-icon">◈</span><span>Recommendations</span>
+    </div>
+    <div class="nav-item" onclick="showPage('analytics')" id="nav-analytics">
+      <span class="nav-icon">◉</span><span>Model Analytics</span>
+    </div>
+    <div class="nav-section">System</div>
+    <div class="nav-item" onclick="showPage('pipeline')" id="nav-pipeline">
+      <span class="nav-icon">⬕</span><span>Pipeline</span>
+    </div>
+  </div>
+  <div class="sidebar-status">
+    <span class="status-dot" id="api-dot"></span>
+    <span class="status-label" id="api-status-label">checking…</span>
+  </div>
+</nav>
+
+<!-- ══ MAIN ═══════════════════════════════════════════════════════════════ -->
+<main class="main">
+
+  <!-- Auto-refresh bar -->
+  <div class="refresh-bar">
+    <span>Last updated: <span id="last-updated" style="font-family:var(--mono)">—</span></span>
+    <div class="refresh-toggle" onclick="toggleAutoRefresh()">
+      <div class="toggle-switch" id="refresh-toggle"></div>
+      <span>Auto-refresh</span>
+      <span class="countdown" id="countdown"></span>
+    </div>
+    <span style="margin-left:auto">Amazon Fine Food Reviews · ~500k reviews</span>
+  </div>
+
+  <!-- ── PAGE: Overview ──────────────────────────────────────────────── -->
+  <section class="page active" id="page-overview">
+    <div class="page-header">
+      <div class="page-tag">// System Overview</div>
+      <h1 class="page-title">Real-Time Recommendation Pipeline</h1>
+      <p class="page-desc">End-to-end Big Data pipeline: Kafka ingestion → Spark ALS training → Streaming scoring → FastAPI → Dashboard</p>
+    </div>
+    <div class="content">
+
+      <!-- Pipeline flow -->
+      <div class="card" style="margin-bottom:28px">
+        <div class="card-title">// Data Flow</div>
+        <div class="pipeline" id="pipeline-flow">
+          <div class="pipe-step" id="pipe-kafka">
+            <div class="pipe-status">·</div>
+            <div class="pipe-icon">📨</div>
+            <div class="pipe-name">Kafka</div>
+            <div class="pipe-desc">amazon-reviews</div>
+          </div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-step" id="pipe-train">
+            <div class="pipe-status">·</div>
+            <div class="pipe-icon">⚡</div>
+            <div class="pipe-name">Spark ALS</div>
+            <div class="pipe-desc">batch training</div>
+          </div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-step" id="pipe-stream">
+            <div class="pipe-status">·</div>
+            <div class="pipe-icon">🌊</div>
+            <div class="pipe-name">Streaming</div>
+            <div class="pipe-desc">micro-batch</div>
+          </div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-step ready">
+            <div class="pipe-status">·</div>
+            <div class="pipe-icon">🗄️</div>
+            <div class="pipe-name">PostgreSQL</div>
+            <div class="pipe-desc">recommendations</div>
+          </div>
+          <div class="pipe-arrow">→</div>
+          <div class="pipe-step ready">
+            <div class="pipe-status">·</div>
+            <div class="pipe-icon">🌐</div>
+            <div class="pipe-name">FastAPI</div>
+            <div class="pipe-desc">REST / JSON</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metrics -->
+      <div class="metrics-grid" id="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-value" id="m-users">—</div>
+          <div class="metric-label">Users Indexed</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="m-recs">—</div>
+          <div class="metric-label">Recommendations Stored</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="m-val-rmse">— <small>RMSE</small></div>
+          <div class="metric-label">Validation RMSE</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="m-test-rmse">— <small>RMSE</small></div>
+          <div class="metric-label">Test RMSE (held-out)</div>
+        </div>
+      </div>
+
+      <!-- Quick lookup -->
+      <div class="card">
+        <div class="card-title">// Quick Lookup</div>
+        <div class="search-bar">
+          <div class="input-wrap">
+            <input type="text" id="quick-user" placeholder="Enter a user ID to preview recommendations…"/>
+          </div>
+          <button class="btn btn-primary" onclick="quickLookup()">Get Recs</button>
+          <button class="btn btn-ghost" onclick="randomUser()">Random User</button>
+        </div>
+        <div id="quick-result"></div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ── PAGE: Recommendations ──────────────────────────────────────── -->
+  <section class="page" id="page-recommendations">
+    <div class="page-header">
+      <div class="page-tag">// Personalized Recommendations</div>
+      <h1 class="page-title">Product Recommendations</h1>
+      <p class="page-desc">Look up Top-N recommendations for any indexed user via the ALS collaborative filtering model.</p>
+    </div>
+    <div class="content">
+      <div class="search-bar">
+        <div class="input-wrap">
+          <input type="text" id="rec-user-input" placeholder="User ID  e.g. A3SGXH7AUHU8GW"
+            onkeydown="if(event.key==='Enter') fetchRecs()"/>
+        </div>
+        <select id="rec-n" style="padding:12px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--mono);font-size:13px;outline:none;cursor:pointer">
+          <option value="5">Top 5</option>
+          <option value="10" selected>Top 10</option>
+          <option value="15">Top 15</option>
+          <option value="20">Top 20</option>
+        </select>
+        <button class="btn btn-primary" onclick="fetchRecs()" id="rec-btn">Search</button>
+        <button class="btn btn-ghost" onclick="randomUser('rec')">Random</button>
+      </div>
+
+      <div id="rec-result"></div>
+
+      <hr class="divider"/>
+      <div class="card">
+        <div class="card-title">// Indexed Users (sample)</div>
+        <div class="user-list" id="user-chips">
+          <div class="loading-row"><div class="spinner"></div> Loading users…</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PAGE: Analytics ────────────────────────────────────────────── -->
+  <section class="page" id="page-analytics">
+    <div class="page-header">
+      <div class="page-tag">// Model Performance</div>
+      <h1 class="page-title">ALS Model Analytics</h1>
+      <p class="page-desc">Training metrics for the Alternating Least Squares collaborative filtering model.</p>
+    </div>
+    <div class="content">
+      <div id="analytics-content">
+        <div class="loading-row"><div class="spinner"></div> Loading model metrics…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PAGE: Pipeline ─────────────────────────────────────────────── -->
+  <section class="page" id="page-pipeline">
+    <div class="page-header">
+      <div class="page-tag">// System Status</div>
+      <h1 class="page-title">Pipeline Status</h1>
+      <p class="page-desc">Real-time status of each pipeline component and the trained model.</p>
+    </div>
+    <div class="content">
+      <div id="pipeline-status-content">
+        <div class="loading-row"><div class="spinner"></div> Fetching status…</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+/* ████  CONFIG  ████ */
+const API  = '/api'; // nginx proxies /api/ → FastAPI
+
+/* ████  STATE  ████ */
+let state = {
+  stats: null, metrics: null, users: [],
+  pipelineStatus: null,
+  autoRefresh: false,
+  refreshInterval: null,
+  countdown: 30,
+  countdownTimer: null,
+  rmseChart: null,
+  splitChart: null,
+};
+
+/* ████  NAVIGATION  ████ */
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + id).classList.add('active');
+  document.getElementById('nav-' + id).classList.add('active');
+  if (id === 'analytics') renderAnalytics();
+  if (id === 'pipeline') renderPipeline();
+}
+
+/* ████  API HELPERS  ████ */
+async function apiFetch(path, params = {}) {
+  const url = new URL(API + path, location.href);
+  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v));
+  const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    throw Object.assign(new Error(err.detail || r.statusText), { status: r.status });
+  }
+  return r.json();
+}
+
+/* ████  HEALTH CHECK  ████ */
+async function checkHealth() {
+  try {
+    await apiFetch('/health');
+    document.getElementById('api-dot').className = 'status-dot online';
+    document.getElementById('api-status-label').textContent = 'API online';
+  } catch {
+    document.getElementById('api-dot').className = 'status-dot offline';
+    document.getElementById('api-status-label').textContent = 'API offline';
+  }
+}
+
+/* ████  LOAD OVERVIEW DATA  ████ */
+async function loadOverview() {
+  try {
+    const [stats, metrics, status] = await Promise.allSettled([
+      apiFetch('/stats'),
+      apiFetch('/metrics'),
+      apiFetch('/pipeline-status'),
+    ]);
+
+    state.stats          = stats.status === 'fulfilled'  ? stats.value  : null;
+    state.metrics        = metrics.status === 'fulfilled' ? metrics.value : null;
+    state.pipelineStatus = status.status === 'fulfilled'  ? status.value : null;
+
+    renderMetricCards();
+    renderPipelineFlow();
+    document.getElementById('last-updated').textContent = new Date().toLocaleTimeString();
+  } catch (e) {
+    console.error('loadOverview error:', e);
+  }
+}
+
+function fmt(n) {
+  if (n == null) return '—';
+  return Number(n).toLocaleString();
+}
+
+function renderMetricCards() {
+  const s = state.stats, m = state.metrics;
+  document.getElementById('m-users').innerHTML     = s ? fmt(s.users_with_recommendations) : '—';
+  document.getElementById('m-recs').innerHTML      = s ? fmt(s.total_recommendation_rows)  : '—';
+  document.getElementById('m-val-rmse').innerHTML  = m ? `${m.val_rmse.toFixed(4)} <small>RMSE</small>` : '— <small>RMSE</small>';
+  document.getElementById('m-test-rmse').innerHTML = m ? `${m.test_rmse.toFixed(4)} <small>RMSE</small>` : '— <small>RMSE</small>';
+}
+
+function renderPipelineFlow() {
+  const ps = state.pipelineStatus;
+  const modelReady = ps && ps.model_ready;
+  // Mark Kafka, Train, Stream as ready based on pipeline status
+  ['pipe-kafka', 'pipe-train', 'pipe-stream'].forEach(id => {
+    const el = document.getElementById(id);
+    if (modelReady) el.classList.add('ready');
+  });
+}
+
+/* ████  QUICK LOOKUP  ████ */
+async function quickLookup() {
+  const uid = document.getElementById('quick-user').value.trim();
+  if (!uid) return;
+  const el = document.getElementById('quick-result');
+  el.innerHTML = '<div class="loading-row"><div class="spinner"></div> Fetching…</div>';
+  try {
+    const data = await apiFetch(`/recommendations/user/${encodeURIComponent(uid)}`, { n: 5 });
+    el.innerHTML = renderRecCards(data, 5);
+  } catch (e) {
+    el.innerHTML = banner(e.status === 404
+      ? 'warn' : 'error',
+      e.message || 'Error fetching recommendations.');
+  }
+}
+
+async function randomUser(target = 'quick') {
+  if (state.users.length === 0) {
+    try { const d = await apiFetch('/users', { limit: 200 }); state.users = d.users; } catch {}
+  }
+  if (!state.users.length) return;
+  const uid = state.users[Math.floor(Math.random() * state.users.length)];
+  if (target === 'rec') {
+    document.getElementById('rec-user-input').value = uid;
+    fetchRecs();
+  } else {
+    document.getElementById('quick-user').value = uid;
+    quickLookup();
+  }
+}
+
+/* ████  RECOMMENDATIONS PAGE  ████ */
+async function fetchRecs() {
+  const uid = document.getElementById('rec-user-input').value.trim();
+  const n   = document.getElementById('rec-n').value;
+  if (!uid) return;
+  const btn = document.getElementById('rec-btn');
+  btn.disabled = true; btn.textContent = '…';
+  const el = document.getElementById('rec-result');
+  el.innerHTML = '<div class="loading-row"><div class="spinner"></div> Fetching recommendations…</div>';
+  try {
+    const data = await apiFetch(`/recommendations/user/${encodeURIComponent(uid)}`, { n });
+    el.innerHTML = `
+      ${banner('info', `Top ${data.recommendations.length} recommendations for <code style="font-family:var(--mono)">${uid}</code>`)}
+      ${renderRecCards(data, n)}
+      <div style="margin-top:12px">
+        <details>
+          <summary style="cursor:pointer;font-size:12px;color:var(--text3);font-family:var(--mono)">raw JSON</summary>
+          <pre style="margin-top:8px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:14px;font-size:11px;overflow:auto;color:var(--teal2)">${JSON.stringify(data, null, 2)}</pre>
+        </details>
+      </div>`;
+  } catch (e) {
+    el.innerHTML = banner(e.status === 404 ? 'warn' : 'error', e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Search';
+  }
+}
+
+async function loadUserChips() {
+  try {
+    const d = await apiFetch('/users', { limit: 100 });
+    state.users = d.users;
+    const c = document.getElementById('user-chips');
+    c.innerHTML = d.users.map(u => `
+      <span class="user-chip" onclick="document.getElementById('rec-user-input').value='${u}';fetchRecs()">${u}</span>
+    `).join('');
+  } catch {
+    document.getElementById('user-chips').innerHTML = banner('error', 'Could not load users.');
+  }
+}
+
+function renderRecCards(data, n) {
+  const recs    = data.recommendations || [];
+  const ratings = data.predicted_ratings || [];
+  return `<div class="rec-grid" style="margin-top:16px">` +
+    recs.map((pid, i) => {
+      const r = ratings[i];
+      const stars = r ? '★'.repeat(Math.round(r)) + '☆'.repeat(5 - Math.round(r)) : '';
+      return `
+        <div class="rec-card" style="animation-delay:${i * 40}ms">
+          <div class="rec-rank">#${i + 1}</div>
+          <div class="rec-body">
+            <div class="rec-product">${pid}</div>
+            ${r ? `<div class="rec-rating"><span class="stars">${stars}</span> ${r.toFixed(2)} predicted</div>` : ''}
+          </div>
+        </div>`;
+    }).join('') + `</div>`;
+}
+
+/* ████  ANALYTICS PAGE  ████ */
+async function renderAnalytics() {
+  const el = document.getElementById('analytics-content');
+  if (!state.metrics) {
+    try { state.metrics = await apiFetch('/metrics'); }
+    catch (e) {
+      el.innerHTML = banner('warn', 'Model metrics not available. Trigger the Airflow DAG to train the model.');
+      return;
+    }
+  }
+  const m = state.metrics;
+  el.innerHTML = `
+    <div class="metrics-grid" style="margin-bottom:28px">
+      <div class="metric-card">
+        <div class="metric-value">${m.val_rmse.toFixed(4)} <small>RMSE</small></div>
+        <div class="metric-label">Validation (10%)</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${m.test_rmse.toFixed(4)} <small>RMSE</small></div>
+        <div class="metric-label">Test held-out (10%)</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${m.unique_users != null ? fmt(m.unique_users) : '—'}</div>
+        <div class="metric-label">Unique Users</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${m.unique_products != null ? fmt(m.unique_products) : '—'}</div>
+        <div class="metric-label">Unique Products</div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title">// RMSE Comparison</div>
+        <canvas id="rmse-chart" height="180"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">// Data Split</div>
+        <canvas id="split-chart" height="180"></canvas>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title">// Best Hyperparameters</div>
+        ${Object.entries(m.best_params).map(([k,v]) =>
+          `<div class="param-row"><span class="param-key">${k}</span><span class="param-val">${v}</span></div>`
+        ).join('')}
+      </div>
+      <div class="card">
+        <div class="card-title">// Training Run Info</div>
+        <div class="param-row"><span class="param-key">training_rows</span><span class="param-val">${fmt(m.train_rows)}</span></div>
+        <div class="param-row"><span class="param-key">started_at</span><span class="param-val" style="font-size:11px">${m.trained_at ? new Date(m.trained_at).toLocaleString() : '—'}</span></div>
+        <div class="param-row"><span class="param-key">finished_at</span><span class="param-val" style="font-size:11px">${m.finished_at ? new Date(m.finished_at).toLocaleString() : '—'}</span></div>
+        <div class="param-row"><span class="param-key">algorithm</span><span class="param-val">ALS (pyspark.ml)</span></div>
+        <div class="param-row"><span class="param-key">cold_start</span><span class="param-val">drop</span></div>
+      </div>
+    </div>
+  `;
+
+  // RMSE Chart
+  if (state.rmseChart) state.rmseChart.destroy();
+  state.rmseChart = new Chart(document.getElementById('rmse-chart'), {
+    type: 'bar',
+    data: {
+      labels: ['Validation RMSE', 'Test RMSE (held-out)'],
+      datasets: [{
+        data: [m.val_rmse, m.test_rmse],
+        backgroundColor: ['rgba(245,158,11,.7)', 'rgba(20,184,166,.7)'],
+        borderColor:     ['rgba(245,158,11,1)',   'rgba(20,184,166,1)'],
+        borderWidth: 1, borderRadius: 4,
+      }],
+    },
+    options: {
+      responsive: true, plugins: { legend: { display: false } },
+      scales: {
+        y: { beginAtZero: false, grid: { color: 'rgba(255,255,255,.04)' }, ticks: { color: '#94a3b8', font: { family: 'Space Mono' } } },
+        x: { grid: { display: false }, ticks: { color: '#94a3b8', font: { family: 'Space Mono', size: 10 } } },
+      },
+    },
+  });
+
+  // Split donut
+  if (state.splitChart) state.splitChart.destroy();
+  state.splitChart = new Chart(document.getElementById('split-chart'), {
+    type: 'doughnut',
+    data: {
+      labels: ['Training (80%)', 'Validation (10%)', 'Test held-out (10%)'],
+      datasets: [{
+        data: [80, 10, 10],
+        backgroundColor: ['rgba(245,158,11,.8)', 'rgba(20,184,166,.8)', 'rgba(99,102,241,.8)'],
+        borderWidth: 0,
+      }],
+    },
+    options: {
+      responsive: true, cutout: '65%',
+      plugins: {
+        legend: { position: 'bottom', labels: { color:'#94a3b8', font:{ family:'DM Sans', size:11 }, padding:12 } },
+      },
+    },
+  });
+}
+
+/* ████  PIPELINE STATUS PAGE  ████ */
+async function renderPipeline() {
+  const el = document.getElementById('pipeline-status-content');
+  try {
+    const ps = await apiFetch('/pipeline-status');
+    state.pipelineStatus = ps;
+    const status = ps.model_ready
+      ? banner('info', '✓ Model trained and ready. Streaming job can generate recommendations.')
+      : banner('warn', '⧖ Model not yet trained. Trigger the <code style="font-family:var(--mono)">recommendation_pipeline</code> DAG in Airflow → http://localhost:8080');
+
+    el.innerHTML = `
+      ${status}
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">// Model Status</div>
+          <div class="param-row"><span class="param-key">model_ready</span>
+            <span class="param-val" style="color:${ps.model_ready ? 'var(--green)' : 'var(--red)'}">
+              ${ps.model_ready ? 'true ✓' : 'false ✗'}
+            </span>
+          </div>
+          <div class="param-row"><span class="param-key">val_rmse</span><span class="param-val">${ps.val_rmse != null ? ps.val_rmse.toFixed(4) : '—'}</span></div>
+          <div class="param-row"><span class="param-key">test_rmse</span><span class="param-val">${ps.test_rmse != null ? ps.test_rmse.toFixed(4) : '—'}</span></div>
+          <div class="param-row"><span class="param-key">train_rows</span><span class="param-val">${fmt(ps.train_rows)}</span></div>
+          <div class="param-row"><span class="param-key">unique_users</span><span class="param-val">${fmt(ps.unique_users)}</span></div>
+          <div class="param-row"><span class="param-key">unique_products</span><span class="param-val">${fmt(ps.unique_products)}</span></div>
+          <div class="param-row"><span class="param-key">trained_at</span><span class="param-val" style="font-size:11px">${ps.trained_at ? new Date(ps.trained_at).toLocaleString() : '—'}</span></div>
+          <div class="param-row"><span class="param-key">finished_at</span><span class="param-val" style="font-size:11px">${ps.finished_at ? new Date(ps.finished_at).toLocaleString() : '—'}</span></div>
+        </div>
+        <div class="card">
+          <div class="card-title">// Services</div>
+          <div class="param-row"><span class="param-key">Zookeeper</span><span class="param-val" style="color:var(--green)">:2181</span></div>
+          <div class="param-row"><span class="param-key">Kafka</span><span class="param-val" style="color:var(--green)">:9092  (topic: amazon-reviews)</span></div>
+          <div class="param-row"><span class="param-key">Spark Master</span><span class="param-val" style="color:var(--green)">:7077  UI→:8090</span></div>
+          <div class="param-row"><span class="param-key">Spark Worker</span><span class="param-val" style="color:var(--green)">2 cores · 2 GB</span></div>
+          <div class="param-row"><span class="param-key">PostgreSQL</span><span class="param-val" style="color:var(--green)">:5433  (recommendations db)</span></div>
+          <div class="param-row"><span class="param-key">Airflow</span><span class="param-val" style="color:var(--green)">:8080  (airflow/airflow)</span></div>
+          <div class="param-row"><span class="param-key">FastAPI</span><span class="param-val" style="color:var(--green)">:8000  /docs</span></div>
+          <div class="param-row"><span class="param-key">Dashboard</span><span class="param-val" style="color:var(--green)">:8501</span></div>
+        </div>
+      </div>`;
+  } catch (e) {
+    el.innerHTML = banner('error', 'Cannot reach API: ' + e.message);
+  }
+}
+
+/* ████  UTILITIES  ████ */
+function banner(type, msg) {
+  const icons = { info: 'ℹ', warn: '⚠', error: '✕' };
+  return `<div class="banner ${type}">${icons[type] || ''} ${msg}</div>`;
+}
+
+/* ████  AUTO-REFRESH  ████ */
+function toggleAutoRefresh() {
+  state.autoRefresh = !state.autoRefresh;
+  const toggle   = document.getElementById('refresh-toggle');
+  const countdown = document.getElementById('countdown');
+  toggle.classList.toggle('on', state.autoRefresh);
+  if (state.autoRefresh) {
+    state.countdown = 30;
+    countdown.textContent = state.countdown + 's';
+    state.countdownTimer = setInterval(() => {
+      state.countdown--;
+      countdown.textContent = state.countdown + 's';
+      if (state.countdown <= 0) {
+        state.countdown = 30;
+        loadOverview();
+        checkHealth();
+      }
+    }, 1000);
+  } else {
+    clearInterval(state.countdownTimer);
+    countdown.textContent = '';
+  }
+}
+
+/* ████  INIT  ████ */
+document.addEventListener('DOMContentLoaded', async () => {
+  await checkHealth();
+  await loadOverview();
+  loadUserChips();
+});
+</script>
+</body>
+</html>

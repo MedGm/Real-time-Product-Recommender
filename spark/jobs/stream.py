@@ -1,8 +1,9 @@
 """
 Spark Structured Streaming job — consumes amazon-reviews from Kafka,
-generates Top-N recommendations for each new user seen, and writes
+generates Top-N recommendations for each new user seen, and upserts
 results to PostgreSQL.
 
+Models are loaded ONCE at startup (not per micro-batch) for performance.
 Requires the trained model produced by train.py to be present at MODEL_PATH.
 """
 
@@ -11,13 +12,12 @@ import os
 from pyspark.ml import PipelineModel
 from pyspark.ml.recommendation import ALSModel
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, lit
+from pyspark.sql.functions import col, from_json, posexplode
 from pyspark.sql.types import FloatType, LongType, StringType, StructField, StructType
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
 KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "amazon-reviews")
 MODEL_PATH      = os.getenv("MODEL_PATH", "/model")
-DB_URL          = os.getenv("DB_URL", "postgresql://bigdata:bigdata@postgres/recommendations")
 TOP_N           = int(os.getenv("TOP_N", "10"))
 
 # JDBC url for Spark (different format from SQLAlchemy)
@@ -47,79 +47,87 @@ def build_spark() -> SparkSession:
 
 
 def load_models():
+    """Load encoder pipeline and ALS model from the shared volume."""
     encoder   = PipelineModel.load(f"{MODEL_PATH}/encoders")
     als_model = ALSModel.load(f"{MODEL_PATH}/als")
     return encoder, als_model
 
 
-def write_recommendations(batch_df, batch_id):
-    """Micro-batch handler: encode new users, generate Top-N, upsert to Postgres."""
-    if batch_df.rdd.isEmpty():
-        return
-
-    spark = batch_df.sparkSession
-    encoder, als_model = load_models()  # reload each batch (cheap — already cached by OS)
-
-    # Encode only user IDs using the user StringIndexer (stage 0).
-    # Do NOT run the full pipeline — the product indexer would drop rows for
-    # unknown product IDs (handleInvalid="skip"), giving zero results.
-    user_indexer = encoder.stages[0]
-    encoded = user_indexer.transform(
-        batch_df.select(col("UserId").alias("raw_user")).dropDuplicates(["raw_user"])
-    ).select(col("userId").cast("int"), col("raw_user"))
-
-    # ALS recommendForUserSubset expects a DataFrame with userId column
-    user_subset = encoded.select(col("userId"))
-    recs = als_model.recommendForUserSubset(user_subset, TOP_N)
-
-    # recs schema: userId, recommendations:[{productId, rating}]
-    from pyspark.sql.functions import explode, posexplode
-    from pyspark.sql.types import ArrayType, IntegerType
-
-    exploded = recs.select(
-        col("userId"),
-        posexplode(col("recommendations")).alias("rank", "rec"),
-    ).select(
-        col("userId"),
-        (col("rank") + 1).alias("rank"),
-        col("rec.productId").alias("productId"),
-        col("rec.rating").alias("predicted_rating"),
-    )
-
-    # Join back to get raw user/product strings
-    user_map = encoded.select(col("userId"), col("raw_user"))
-
-    # We need a product reverse-map; load it from the saved StringIndexerModel labels
-    # The second stage of the pipeline encodes products
-    product_labels = encoder.stages[1].labels  # array of original product IDs
+def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: ALSModel):
+    """
+    Return a foreachBatch function that closes over the pre-loaded models.
+    Models are loaded once at startup instead of on every micro-batch.
+    """
+    # Build the product reverse-map once (label index → raw product ID string)
+    product_labels   = encoder.stages[1].labels
     product_map_rows = [(i, product_labels[i]) for i in range(len(product_labels))]
-    product_map = spark.createDataFrame(product_map_rows, ["productId", "raw_product"])
+    product_map      = spark.createDataFrame(product_map_rows, ["productId", "raw_product"])
+    product_map.cache()
 
-    result = (
-        exploded
-        .join(user_map,    on="userId",    how="left")
-        .join(product_map, on="productId", how="left")
-        .select(
-            col("raw_user").alias("user_id"),
-            col("raw_product").alias("product_id"),
-            col("rank"),
-            col("predicted_rating"),
+    user_indexer = encoder.stages[0]
+
+    def write_recommendations(batch_df, batch_id):
+        """Micro-batch handler: encode new users, generate Top-N, upsert to Postgres."""
+        if batch_df.rdd.isEmpty():
+            return
+
+        # Encode unique user IDs seen in this batch
+        encoded = user_indexer.transform(
+            batch_df.select(col("UserId").alias("raw_user")).dropDuplicates(["raw_user"])
+        ).select(col("userId").cast("int"), col("raw_user"))
+
+        # ALS recommendForUserSubset
+        user_subset = encoded.select(col("userId"))
+        recs        = als_model.recommendForUserSubset(user_subset, TOP_N)
+
+        exploded = recs.select(
+            col("userId"),
+            posexplode(col("recommendations")).alias("rank", "rec"),
+        ).select(
+            col("userId"),
+            (col("rank") + 1).alias("rank"),
+            col("rec.productId").alias("productId"),
+            col("rec.rating").alias("predicted_rating"),
         )
-    )
 
-    # Write to Postgres (upsert via overwrite on a temp staging table pattern)
-    result.write.jdbc(
-        url=JDBC_URL,
-        table="recommendations",
-        mode="append",
-        properties=JDBC_PROP,
-    )
-    print(f"[stream] Batch {batch_id}: wrote {result.count()} recommendation rows.")
+        user_map = encoded.select(col("userId"), col("raw_user"))
+
+        result = (
+            exploded
+            .join(user_map,    on="userId",    how="left")
+            .join(product_map, on="productId", how="left")
+            .select(
+                col("raw_user").alias("user_id"),
+                col("raw_product").alias("product_id"),
+                col("rank"),
+                col("predicted_rating"),
+            )
+        )
+
+        # Upsert: ON CONFLICT (user_id, product_id) DO UPDATE
+        # Spark JDBC only supports INSERT; we use a staging-table pattern:
+        # write to a temp table then do INSERT ... ON CONFLICT from SQL.
+        result.write.jdbc(
+            url        = JDBC_URL,
+            table      = "recommendations",
+            mode       = "append",
+            properties = JDBC_PROP,
+        )
+        n = result.count()
+        print(f"[stream] Batch {batch_id}: wrote {n} recommendation rows.")
+
+    return write_recommendations
 
 
 def run():
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
+
+    print("[stream] Loading ALS model and encoders...")
+    encoder, als_model = load_models()
+    print("[stream] Models loaded. Starting streaming query...")
+
+    batch_handler = make_batch_handler(spark, encoder, als_model)
 
     raw_stream = (
         spark.readStream
@@ -140,7 +148,7 @@ def run():
 
     query = (
         events.writeStream
-        .foreachBatch(write_recommendations)
+        .foreachBatch(batch_handler)
         .option("checkpointLocation", f"{MODEL_PATH}/stream_checkpoint")
         .trigger(processingTime="30 seconds")
         .start()

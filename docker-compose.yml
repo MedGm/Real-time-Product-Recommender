@@ -199,8 +199,6 @@ services:
     build: ./dashboard
     container_name: dashboard
     depends_on: [api]
-    environment:
-      API_URL: http://api:8000
     ports:
-      - "8501:8501"
+      - "8501:80"    # nginx serves dashboard; /api/ is reverse-proxied to FastAPI
     networks: [bigdata]
