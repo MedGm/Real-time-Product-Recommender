@@ -116,15 +116,18 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
         try:
             with conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"""
-                        INSERT INTO recommendations (user_id, product_id, rank, predicted_rating)
-                        SELECT user_id, product_id, rank, predicted_rating FROM {staging}
-                        ON CONFLICT (user_id, product_id) DO UPDATE SET
-                            rank             = EXCLUDED.rank,
-                            predicted_rating = EXCLUDED.predicted_rating,
-                            created_at       = now()
-                    """)
-                    cur.execute(f"DROP TABLE IF EXISTS {staging}")
+                    staging_id = pgsql.Identifier(staging)
+                    cur.execute(
+                        pgsql.SQL("""
+                            INSERT INTO recommendations (user_id, product_id, rank, predicted_rating)
+                            SELECT user_id, product_id, rank, predicted_rating FROM {}
+                            ON CONFLICT (user_id, product_id) DO UPDATE SET
+                                rank             = EXCLUDED.rank,
+                                predicted_rating = EXCLUDED.predicted_rating,
+                                created_at       = now()
+                        """).format(staging_id)
+                    )
+                    cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(staging_id))
         finally:
             conn.close()
 
