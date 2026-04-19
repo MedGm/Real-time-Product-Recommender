@@ -6,7 +6,7 @@
 
 ## Architecture
 
-![Architecture diagram](Real-Time%20Product%20Recommender%20—%20Big%20Data%20Pipeline.drawio.png)
+![Architecture diagram](architecture.png)
 
 ---
 
