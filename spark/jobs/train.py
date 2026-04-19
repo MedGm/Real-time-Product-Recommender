@@ -21,6 +21,7 @@ from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
+from pyspark.ml.tuning import ParamGridBuilder
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, count
 
@@ -109,7 +110,6 @@ def train(spark: SparkSession):
     )
 
     # Hyperparameter grid (manually evaluated on val_df)
-    from pyspark.ml.tuning import ParamGridBuilder
     param_grid = (
         ParamGridBuilder()
         .addGrid(als.rank,     [10, 20])

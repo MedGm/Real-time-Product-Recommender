@@ -9,6 +9,8 @@ Requires the trained model produced by train.py to be present at MODEL_PATH.
 
 import os
 
+import psycopg2
+from psycopg2 import sql as pgsql
 from pyspark.ml import PipelineModel
 from pyspark.ml.recommendation import ALSModel
 from pyspark.sql import SparkSession
@@ -37,6 +39,7 @@ def build_spark() -> SparkSession:
         SparkSession.builder
         .appName("ALS-Streaming")
         .config("spark.sql.shuffle.partitions", "10")
+        .config("spark.sql.streaming.kafka.useDeprecatedOffsetFetching", "false")
         .config(
             "spark.jars.packages",
             "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
@@ -104,17 +107,29 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
             )
         )
 
-        # Upsert: ON CONFLICT (user_id, product_id) DO UPDATE
-        # Spark JDBC only supports INSERT; we use a staging-table pattern:
-        # write to a temp table then do INSERT ... ON CONFLICT from SQL.
-        result.write.jdbc(
-            url        = JDBC_URL,
-            table      = "recommendations",
-            mode       = "append",
-            properties = JDBC_PROP,
-        )
+        # Upsert via staging table: write to temp, then INSERT ... ON CONFLICT DO UPDATE
+        staging = f"recs_staging_{batch_id}"
+        result.write.jdbc(url=JDBC_URL, table=staging, mode="overwrite", properties=JDBC_PROP)
+
+        conn = psycopg2.connect(host="postgres", port=5432, dbname="recommendations",
+                                user="bigdata", password="bigdata")
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        INSERT INTO recommendations (user_id, product_id, rank, predicted_rating)
+                        SELECT user_id, product_id, rank, predicted_rating FROM {staging}
+                        ON CONFLICT (user_id, product_id) DO UPDATE SET
+                            rank             = EXCLUDED.rank,
+                            predicted_rating = EXCLUDED.predicted_rating,
+                            created_at       = now()
+                    """)
+                    cur.execute(f"DROP TABLE IF EXISTS {staging}")
+        finally:
+            conn.close()
+
         n = result.count()
-        print(f"[stream] Batch {batch_id}: wrote {n} recommendation rows.")
+        print(f"[stream] Batch {batch_id}: upserted {n} recommendation rows.")
 
     return write_recommendations
 
