@@ -77,6 +77,11 @@ services:
       - "7077:7077"
     environment:
       SPARK_NO_DAEMONIZE: "true"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: recommendations
+      POSTGRES_USER: bigdata
+      POSTGRES_PASSWORD: bigdata
     volumes:
       - ./spark/jobs:/jobs
       - ./dataset:/dataset:ro
@@ -180,6 +185,11 @@ services:
       SPARK_MASTER: spark://spark-master:7077
       KAFKA_BOOTSTRAP: kafka:29092
       PYSPARK_PYTHON: python3
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: recommendations
+      POSTGRES_USER: bigdata
+      POSTGRES_PASSWORD: bigdata
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs

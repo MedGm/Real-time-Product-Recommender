@@ -17,6 +17,8 @@ import os
 import shutil
 from datetime import datetime, timezone
 
+import psycopg2
+
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.feature import StringIndexer
@@ -27,6 +29,12 @@ from pyspark.sql.functions import col, count
 
 CSV_PATH   = os.getenv("CSV_PATH", "/dataset/Reviews.csv")
 MODEL_PATH = os.getenv("MODEL_PATH", "/model")
+
+_PG_HOST = os.getenv("POSTGRES_HOST", "postgres")
+_PG_PORT = os.getenv("POSTGRES_PORT", "5432")
+_PG_DB   = os.getenv("POSTGRES_DB",   "recommendations")
+_PG_USER = os.getenv("POSTGRES_USER", "bigdata")
+_PG_PASS = os.getenv("POSTGRES_PASSWORD", "bigdata")
 
 # Filtering thresholds — drop rare users / items
 MIN_USER_RATINGS    = int(os.getenv("MIN_USER_RATINGS", "5"))
@@ -168,6 +176,33 @@ def train(spark: SparkSession):
     }
     with open(f"{MODEL_PATH}/metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2)
+
+    try:
+        conn = psycopg2.connect(
+            host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
+            user=_PG_USER, password=_PG_PASS
+        )
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO model_runs
+                        (val_rmse, test_rmse, best_rank, best_reg, best_iter, train_rows)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        best_rmse,
+                        test_rmse,
+                        best_params.get("rank"),
+                        best_params.get("regParam"),
+                        best_params.get("maxIter"),
+                        row_count,
+                    ),
+                )
+        conn.close()
+        print("[train] Model run logged to model_runs table.")
+    except Exception as exc:
+        print(f"[train] Warning: could not log to model_runs: {exc}")
 
     print(f"[train] Model saved to {MODEL_PATH}")
     return encoder, best_model
