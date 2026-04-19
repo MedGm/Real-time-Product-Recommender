@@ -6,8 +6,16 @@ Orchestrates the full pipeline:
   2. spark_train     — runs the ALS batch training job (local mode, reads CSV)
   3. print_metrics   — reads /model/metrics.json and logs RMSE to Airflow
 
-The spark-stream service runs as an always-on Docker container that starts
-automatically once /model/metrics.json is present (no DAG task needed).
+Architectural note — producer and spark-stream as always-on services:
+  The Kafka producer and the Spark streaming job run as long-lived Docker services
+  (producer, spark-stream) rather than as DAG tasks. This is intentional:
+  - The producer streams the CSV continuously; tying it to a DAG task would require
+    waiting for it to finish before training, which defeats streaming semantics.
+  - The streaming job is perpetually live; it self-gates on /model/metrics.json
+    being present before starting inference.
+  The DAG's role is to gate on sufficient data (KafkaTopicSensor), run batch
+  training, and surface metrics — the standard Lambda-architecture split between
+  batch and speed layers.
 
 Schedule: manual trigger (or uncomment schedule_interval for nightly retraining)
 """
