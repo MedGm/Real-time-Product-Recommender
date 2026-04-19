@@ -1,3 +1,6 @@
+# Environment / secrets
+.env
+
 # Dataset (too large for git)
 dataset/
 
