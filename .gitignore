@@ -26,3 +26,6 @@ airflow/logs/
 
 # OS
 .DS_Store
+
+# Claude Skills
+docs/superpowers

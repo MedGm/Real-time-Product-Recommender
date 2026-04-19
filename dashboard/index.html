@@ -731,7 +731,8 @@ function renderRecCards(data, n) {
   return `<div class="rec-grid" style="margin-top:16px">` +
     recs.map((pid, i) => {
       const r = ratings[i];
-      const stars = r ? '★'.repeat(Math.round(r)) + '☆'.repeat(5 - Math.round(r)) : '';
+      const filled = r ? Math.min(5, Math.max(1, Math.round(r))) : 0;
+      const stars = r ? '★'.repeat(filled) + '☆'.repeat(5 - filled) : '';
       return `
         <div class="rec-card" style="animation-delay:${i * 40}ms">
           <div class="rec-rank">#${i + 1}</div>
