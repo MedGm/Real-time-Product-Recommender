@@ -154,7 +154,7 @@ services:
         until python3 -c \"import psycopg2; psycopg2.connect('postgresql://bigdata:bigdata@postgres/airflow')\" 2>/dev/null; do
           echo 'Waiting for postgres...'; sleep 3;
         done &&
-        airflow db init &&
+        (airflow db init || true) && airflow db migrate &&
         airflow users create --username airflow --password airflow --firstname Air --lastname Flow --role Admin --email admin@example.com 2>/dev/null || true &&
         airflow scheduler &
         airflow webserver"
