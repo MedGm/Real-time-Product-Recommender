@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Real-time product recommendation system using the Amazon Fine Food Reviews dataset (~500k reviews). The pipeline is: Kafka ingestion → Spark ALS training → Airflow orchestration → FastAPI/Streamlit dashboard.
+Real-time product recommendation system using the Amazon Fine Food Reviews dataset (~500k reviews). The pipeline is: Kafka ingestion → Spark ALS training → Airflow orchestration → FastAPI + Nginx dashboard.
 
 Dataset: `dataset/Reviews.csv` — columns: `Id, ProductId, UserId, ProfileName, HelpfulnessNumerator, HelpfulnessDenominator, Score, Time, Summary, Text`. Only `UserId`, `ProductId`, `Score`, and `Time` are used by the pipeline.
 
@@ -17,7 +17,7 @@ docker-compose.yml
 ├── airflow                    # orchestration (DAGs)
 ├── postgres                   # store recommendations/results
 ├── api (FastAPI)              # GET /recommendations/user/{id}
-└── dashboard (Streamlit)      # interactive web UI
+└── dashboard (Nginx + HTML/JS) # interactive web UI (static, proxies /api/ to FastAPI)
 ```
 
 ### Planned directory layout
