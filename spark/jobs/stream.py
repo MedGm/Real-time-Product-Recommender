@@ -22,9 +22,14 @@ KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "amazon-reviews")
 MODEL_PATH      = os.getenv("MODEL_PATH", "/model")
 TOP_N           = int(os.getenv("TOP_N", "10"))
 
-# JDBC url for Spark (different format from SQLAlchemy)
-JDBC_URL  = "jdbc:postgresql://postgres:5432/recommendations"
-JDBC_PROP = {"user": "bigdata", "password": "bigdata", "driver": "org.postgresql.Driver"}
+_PG_HOST = os.getenv("POSTGRES_HOST", "postgres")
+_PG_PORT = os.getenv("POSTGRES_PORT", "5432")
+_PG_DB   = os.getenv("POSTGRES_DB",   "recommendations")
+_PG_USER = os.getenv("POSTGRES_USER", "bigdata")
+_PG_PASS = os.getenv("POSTGRES_PASSWORD", "bigdata")
+
+JDBC_URL  = f"jdbc:postgresql://{_PG_HOST}:{_PG_PORT}/{_PG_DB}"
+JDBC_PROP = {"user": _PG_USER, "password": _PG_PASS, "driver": "org.postgresql.Driver"}
 
 EVENT_SCHEMA = StructType([
     StructField("UserId",    StringType(), True),
@@ -111,8 +116,10 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
         staging = f"recs_staging_{batch_id}"
         result.write.jdbc(url=JDBC_URL, table=staging, mode="overwrite", properties=JDBC_PROP)
 
-        conn = psycopg2.connect(host="postgres", port=5432, dbname="recommendations",
-                                user="bigdata", password="bigdata")
+        conn = psycopg2.connect(
+            host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
+            user=_PG_USER, password=_PG_PASS
+        )
         try:
             with conn:
                 with conn.cursor() as cur:

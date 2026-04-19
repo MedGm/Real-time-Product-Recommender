@@ -19,12 +19,20 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     networks: [bigdata]
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
     restart: on-failure
-    depends_on: [zookeeper]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
     ports:
       - "9092:9092"
     environment:
@@ -36,15 +44,21 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     networks: [bigdata]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 2>/dev/null | grep -q '(id:'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
   kafka-init:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka-init
-    depends_on: [kafka]
+    depends_on:
+      kafka:
+        condition: service_healthy
     entrypoint: >
       bash -c "
-        echo 'Waiting for Kafka...' &&
-        cub kafka-ready -b kafka:29092 1 60 &&
         kafka-topics --create --if-not-exists --bootstrap-server kafka:29092
           --replication-factor 1 --partitions 1 --topic amazon-reviews &&
         echo 'Topic amazon-reviews created.'
@@ -90,18 +104,30 @@ services:
   spark-stream:
     build: ./spark
     container_name: spark-stream
-    depends_on: [spark-master, kafka, postgres]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      postgres:
+        condition: service_started
     restart: unless-stopped
     command: >-
       bash -c "until [ -f /model/metrics.json ]; do echo 'Waiting for model...'; sleep 10; done &&
       /opt/spark/bin/spark-submit --master local[2]
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.3
       --conf spark.sql.shuffle.partitions=10
+      --conf spark.sql.streaming.kafka.useDeprecatedOffsetFetching=false
       /jobs/stream.py"
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
       MODEL_PATH: /model
       PYSPARK_PYTHON: python3
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: recommendations
+      POSTGRES_USER: bigdata
+      POSTGRES_PASSWORD: bigdata
     volumes:
       - ./spark/jobs:/jobs
       - spark_model:/model
@@ -124,6 +150,12 @@ services:
     ports:
       - "5433:5432"
     networks: [bigdata]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bigdata -d recommendations"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   # ─────────────────────────────────────────
   # Airflow
@@ -132,7 +164,13 @@ services:
     build: ./airflow
     container_name: airflow
     user: "0"   # root — needed to clean up model files written by spark-worker
-    depends_on: [postgres, kafka, spark-master]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://bigdata:bigdata@postgres/airflow
@@ -152,11 +190,8 @@ services:
       - "8080:8080"
     command: >-
       bash -c "
-        until python3 -c \"import psycopg2; psycopg2.connect('postgresql://bigdata:bigdata@postgres/airflow')\" 2>/dev/null; do
-          echo 'Waiting for postgres...'; sleep 3;
-        done &&
-        (airflow db init || true) && airflow db migrate &&
-        airflow users create --username airflow --password airflow --firstname Air --lastname Flow --role Admin --email admin@example.com 2>/dev/null || true &&
+        airflow db migrate &&
+        (airflow users create --username airflow --password airflow --firstname Air --lastname Flow --role Admin --email admin@example.com || true) &&
         airflow scheduler &
         airflow webserver"
     networks: [bigdata]
@@ -167,7 +202,9 @@ services:
   producer:
     build: ./producer
     container_name: producer
-    depends_on: [kafka-init]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
       KAFKA_TOPIC: amazon-reviews
@@ -184,7 +221,9 @@ services:
   api:
     build: ./api
     container_name: api
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       DB_URL: postgresql://bigdata:bigdata@postgres/recommendations
     volumes:
