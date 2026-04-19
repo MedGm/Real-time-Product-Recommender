@@ -6,47 +6,7 @@
 
 ## Architecture
 
-```
-dataset/Reviews.csv  (300 MB · ~568 k rows)
-        │
-        ▼
-┌─────────────┐      topic: amazon-reviews
-│  Producer   │ ──────────────────────────► Kafka (port 9092)
-└─────────────┘                                    │
-                                                   ▼
-                                     ┌─────────────────────────┐
-                                     │  spark/jobs/train.py    │  (batch, ALS)
-                                     │  80% train · 10% val    │
-                                     │  10% test (held-out)    │
-                                     └────────────┬────────────┘
-                                                  │  /model/als + /model/encoders
-                                                  ▼
-                             ┌──────────────────────────────────────┐
-                             │  spark/jobs/stream.py (Structured    │
-                             │  Streaming · micro-batch 30 s)       │
-                             │  Kafka → Top-N ALS → PostgreSQL      │
-                             └──────────────────┬───────────────────┘
-                                                │
-                            ┌───────────────────▼──────────────────┐
-                            │  PostgreSQL :5433                    │
-                            │  tables: recommendations, model_runs │
-                            └───────────────────┬──────────────────┘
-                                                │
-                  ┌─────────────────────────────▼───────────────────────────┐
-                  │  FastAPI :8000                                          │
-                  │  GET /recommendations/user/{id}   GET /metrics          │
-                  │  GET /pipeline-status             GET /stats            │
-                  └─────────────────────────────┬───────────────────────────┘
-                                                │
-                              ┌─────────────────▼──────────────────┐
-                              │  Dashboard :8501  (nginx + HTML/JS)│
-                              │  Overview · Recommendations ·      │
-                              │  Model Analytics · Pipeline Status │
-                              └────────────────────────────────────┘
-
-Airflow :8080 — orchestrates Kafka sensor → spark_train → print_metrics
-Spark UI :8090 — job monitoring
-```
+![Architecture diagram](Real-Time%20Product%20Recommender%20—%20Big%20Data%20Pipeline.drawio.png)
 
 ---
 
