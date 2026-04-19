@@ -138,8 +138,7 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
         finally:
             conn.close()
 
-        n = result.count()
-        print(f"[stream] Batch {batch_id}: upserted {n} recommendation rows.")
+        print(f"[stream] Batch {batch_id}: upsert complete.")
 
     return write_recommendations
 
