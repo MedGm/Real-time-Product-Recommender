@@ -20,11 +20,11 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     networks: [bigdata]
     healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 15s
+      start_period: 30s
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -57,14 +57,15 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: >
-      bash -c "
+    entrypoint:
+      - bash
+      - -c
+      - >-
         kafka-topics --create --if-not-exists --bootstrap-server kafka:29092
-          --replication-factor 1 --partitions 1 --topic amazon-reviews &&
-        echo 'Topic amazon-reviews created.'
-      "
+        --replication-factor 1 --partitions 1 --topic amazon-reviews
+        && echo 'Topic amazon-reviews created.'
     networks: [bigdata]
-
+    
   # ─────────────────────────────────────────
   # Spark
   # ─────────────────────────────────────────
@@ -84,7 +85,6 @@ services:
       POSTGRES_PASSWORD: bigdata
     volumes:
       - ./spark/jobs:/jobs
-      - ./dataset:/dataset:ro
       - spark_model:/model
     networks: [bigdata]
     healthcheck:
@@ -107,12 +107,16 @@ services:
       SPARK_WORKER_CORES: "2"
     volumes:
       - ./spark/jobs:/jobs
-      - ./dataset:/dataset:ro
       - spark_model:/model
     networks: [bigdata]
 
   # ─────────────────────────────────────────
-  # Spark Streaming (always-on, restarts automatically)
+  # Spark Streaming (always-on inference service)
+  #
+  # Loads the frozen ALS model once at startup and applies it to new
+  # Kafka events continuously (micro-batch every 30 s).
+  # Airflow's restart_streaming_service task issues `docker restart spark-stream`
+  # after each training run so the service reloads the new model.
   # ─────────────────────────────────────────
   spark-stream:
     build: ./spark
@@ -147,7 +151,7 @@ services:
     networks: [bigdata]
 
   # ─────────────────────────────────────────
-  # PostgreSQL (stores recommendations)
+  # PostgreSQL (stores recommendations + model_runs)
   # ─────────────────────────────────────────
   postgres:
     image: postgres:15
@@ -171,12 +175,17 @@ services:
       start_period: 15s
 
   # ─────────────────────────────────────────
-  # Airflow
+  # Airflow — orchestrates the 4-task DAG:
+  #   wait_for_kafka_messages → spark_batch_training
+  #   → restart_streaming_service → print_model_metrics
+  #
+  # Docker socket is mounted so Airflow can issue
+  # `docker restart spark-stream` in task 3.
   # ─────────────────────────────────────────
   airflow:
     build: ./airflow
     container_name: airflow
-    user: "0"   # root — needed to clean up model files written by spark-worker
+    user: "0"   # root — needed for docker socket access and model file cleanup
     depends_on:
       postgres:
         condition: service_healthy
@@ -192,6 +201,9 @@ services:
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
       SPARK_MASTER: spark://spark-master:7077
       KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_TOPIC: amazon-reviews
+      MAX_ROWS: "50000"          # used by KafkaTopicSensor threshold
+      KAFKA_MIN_MSGS: "10000"    # sensor triggers training once this many msgs exist (≤ MAX_ROWS)
       PYSPARK_PYTHON: python3
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -199,10 +211,10 @@ services:
       POSTGRES_USER: bigdata
       POSTGRES_PASSWORD: bigdata
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # needed for `docker restart spark-stream`
       - ./airflow/dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs
       - ./spark/jobs:/jobs
-      - ./dataset:/dataset:ro
       - spark_model:/model
     ports:
       - "8080:8080"
@@ -210,16 +222,20 @@ services:
       bash -c "
         airflow db migrate &&
         (airflow users create --username airflow --password airflow --firstname Air --lastname Flow --role Admin --email admin@example.com || true) &&
-        airflow scheduler &
-        airflow webserver"
+        { airflow scheduler & exec airflow webserver; }
+      "
     networks: [bigdata]
 
   # ─────────────────────────────────────────
-  # Kafka Producer (runs once, streams CSV)
+  # Kafka Producer
+  # Streams Reviews.csv row-by-row to the Kafka topic.
+  # Exits cleanly after MAX_ROWS messages (or full dataset).
+  # restart: on-failure retries if it crashes mid-stream.
   # ─────────────────────────────────────────
   producer:
     build: ./producer
     container_name: producer
+    restart: on-failure
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -234,7 +250,7 @@ services:
     networks: [bigdata]
 
   # ─────────────────────────────────────────
-  # FastAPI
+  # FastAPI — serves recommendations from PostgreSQL
   # ─────────────────────────────────────────
   api:
     build: ./api
@@ -251,7 +267,8 @@ services:
     networks: [bigdata]
 
   # ─────────────────────────────────────────
-  # Streamlit dashboard
+  # Dashboard (Nginx + HTML/JS)
+  # Serves the static SPA and reverse-proxies /api/ → FastAPI
   # ─────────────────────────────────────────
   dashboard:
     build: ./dashboard

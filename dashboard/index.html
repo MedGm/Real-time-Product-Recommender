@@ -243,30 +243,50 @@
     /* ── Rec cards ── */
     .rec-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 14px;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 16px;
     }
     .rec-card {
       background: var(--bg2); border: 1px solid var(--border);
-      border-radius: 8px; padding: 16px;
-      display: flex; align-items: flex-start; gap: 14px;
+      border-radius: 12px; padding: 16px;
+      display: flex; align-items: stretch; gap: 16px;
       transition: all .2s ease;
       animation: slideInUp .3s ease both;
+      position: relative; overflow: hidden;
     }
-    .rec-card:hover { border-color: var(--amber); transform: translateY(-2px); }
+    .rec-card:hover { 
+      border-color: var(--amber); 
+      transform: translateY(-3px); 
+      box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+    }
     @keyframes slideInUp { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+    
     .rec-rank {
-      font-family: var(--mono); font-size: 11px;
-      color: var(--amber); min-width: 28px; padding-top: 2px;
+      position: absolute; top: 0; left: 0;
+      background: var(--amber); color: #000;
+      font-family: var(--mono); font-size: 10px; font-weight: 700;
+      padding: 3px 8px; border-bottom-right-radius: 8px;
+      z-index: 2;
     }
-    .rec-body { flex: 1; min-width: 0; }
-    .rec-product {
-      font-family: var(--mono); font-size: 12px;
-      color: var(--teal2); word-break: break-all;
-      margin-bottom: 4px;
+    .rec-image {
+      width: 76px; height: 76px; border-radius: 8px;
+      object-fit: cover; background: var(--bg3);
+      border: 1px solid var(--border); flex-shrink: 0;
+      margin-top: 4px;
     }
-    .rec-rating { font-size: 11px; color: var(--text3); }
-    .stars { color: var(--amber); font-size: 12px; }
+    .rec-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+    
+    .rec-brand { font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px; }
+    .rec-title { font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .rec-category { font-size: 11px; color: var(--teal); background: rgba(20,184,166,0.1); padding: 2px 6px; border-radius: 4px; display: inline-block; width: max-content; margin-bottom: 8px; }
+    
+    .rec-footer { display: flex; justify-content: space-between; align-items: flex-end; margin-top: auto; }
+    .rec-price { font-family: var(--mono); font-size: 15px; font-weight: 700; color: var(--text); }
+    
+    .rec-rating { font-size: 11px; color: var(--text2); text-align: right; }
+    .rec-rating-score { color: var(--text); font-weight: 600; }
+    .stars { color: var(--amber); font-size: 12px; letter-spacing: -1px; }
+    .rec-asin { font-family: var(--mono); font-size: 9px; color: var(--text3); margin-top: 2px; }
 
     /* ── Users table ── */
     .user-list {
@@ -725,6 +745,39 @@ async function loadUserChips() {
   }
 }
 
+/* ████  PROCEDURAL PRODUCT METADATA  ████ */
+function getProductMetadata(pid) {
+  let hash = 0;
+  for (let i = 0; i < pid.length; i++) { hash = pid.charCodeAt(i) + ((hash << 5) - hash); }
+  hash = Math.abs(hash);
+
+  const adjs = ['Premium', 'Organic', 'Gourmet', 'Spicy', 'Sweet', 'Artisan', 'Healthy', 'Delicious', 'Natural', 'Roasted', 'Crispy', 'Classic'];
+  const nouns = ['Coffee Beans', 'Dark Chocolate', 'Green Tea', 'Almonds', 'Honey', 'Hot Sauce', 'Pasta', 'Olive Oil', 'Energy Bar', 'Cookies', 'Peanut Butter', 'Dog Food', 'Oatmeal', 'Espresso'];
+  const brands = ['AmazonFresh', 'Kirkland', 'Trader Joe\'s', 'Whole Foods', 'Nature\'s Path', 'KIND', 'Lindt', 'Keto Snack Co.', 'Planters', 'Ghirardelli'];
+  const categories = ['Snacks', 'Beverages', 'Pantry', 'Health', 'Pets', 'Sweets', 'Breakfast', 'Baking'];
+  
+  const IMAGES = [
+    "https://images.unsplash.com/photo-1511920170033-f8396924c348?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1548689816-c399f954f3dd?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1563805042-7684c1f9e149?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1599599810769-bcde5a160d32?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1550989460-0adf9ea622e2?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1583847268964-b28e2025cc7c?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1621939514649-280e2ee25f60?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1498579150354-977475b7e0b2?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1585238342024-78d387f4a707?w=200&h=200&fit=crop",
+    "https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=200&h=200&fit=crop"
+  ];
+
+  return {
+    title: `${brands[hash % brands.length]} ${adjs[(hash >> 2) % adjs.length]} ${nouns[(hash >> 4) % nouns.length]}`,
+    brand: brands[hash % brands.length],
+    category: categories[(hash >> 3) % categories.length],
+    price: ((hash % 4000) / 100 + 4.99).toFixed(2),
+    imgUrl: IMAGES[hash % IMAGES.length]
+  };
+}
+
 function renderRecCards(data, n) {
   const recs    = data.recommendations || [];
   const ratings = data.predicted_ratings || [];
@@ -733,12 +786,23 @@ function renderRecCards(data, n) {
       const r = ratings[i];
       const filled = r ? Math.min(5, Math.max(1, Math.round(r))) : 0;
       const stars = r ? '★'.repeat(filled) + '☆'.repeat(5 - filled) : '';
+      const meta = getProductMetadata(pid);
+      
       return `
-        <div class="rec-card" style="animation-delay:${i * 40}ms">
+        <div class="rec-card" style="animation-delay:${i * 40}ms" title="${meta.title} (${pid})">
           <div class="rec-rank">#${i + 1}</div>
+          <img class="rec-image" src="${meta.imgUrl}" alt="Product image" loading="lazy" />
           <div class="rec-body">
-            <div class="rec-product">${pid}</div>
-            ${r ? `<div class="rec-rating"><span class="stars">${stars}</span> ${r.toFixed(2)} predicted</div>` : ''}
+            <div class="rec-brand">${meta.brand}</div>
+            <div class="rec-title">${meta.title}</div>
+            <div class="rec-category">${meta.category}</div>
+            <div class="rec-footer">
+              <div class="rec-price">$${meta.price}</div>
+              <div class="rec-rating">
+                ${r ? `<div class="stars">${stars}</div><div><span class="rec-rating-score">${r.toFixed(2)}</span> / 5.0</div>` : ''}
+                <div class="rec-asin">ASIN: ${pid}</div>
+              </div>
+            </div>
           </div>
         </div>`;
     }).join('') + `</div>`;

@@ -3,10 +3,27 @@ Spark Structured Streaming job — consumes amazon-reviews from Kafka,
 generates Top-N recommendations for each new user seen, and upserts
 results to PostgreSQL.
 
+Architecture note — this job applies a FROZEN ALS model, it does NOT retrain:
+  train.py uses spark.read.format("kafka")   → bounded snapshot → ALS training
+  stream.py uses spark.readStream.format("kafka") → unbounded stream → inference
+
+  After each retraining run, Airflow's restart_streaming_service task issues
+  `docker restart spark-stream`. Because this service has restart: unless-stopped
+  in Docker Compose, it comes back up and reloads the newly saved model.
+
 Models are loaded ONCE at startup (not per micro-batch) for performance.
-Requires the trained model produced by train.py to be present at MODEL_PATH.
+Requires the trained model produced by train.py to be present at MODEL_PATH
+(signalled by /model/metrics.json existing — the Docker entrypoint self-gates on this).
+
+Checkpoint note:
+  startingOffsets="earliest" means a cold start (or wiped checkpoint) will replay
+  ALL Kafka messages. The checkpoint at /model/stream_checkpoint prevents
+  re-processing between normal restarts. Running `docker compose down -v`
+  wipes the checkpoint volume — full replay will occur on the next start.
+  This is acceptable for demos; in production, use a persistent external checkpoint.
 """
 
+import json
 import os
 
 import psycopg2
@@ -61,10 +78,33 @@ def load_models():
     return encoder, als_model
 
 
-def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: ALSModel):
+def load_popular_products() -> list:
+    """
+    Load the top-N popular products precomputed by train.py.
+    Used as a cold-start fallback for users not seen during ALS training.
+    Returns an empty list if the file does not exist yet.
+    """
+    path = f"{MODEL_PATH}/popular_products.json"
+    if not os.path.exists(path):
+        print("[stream] popular_products.json not found — cold-start fallback disabled.")
+        return []
+    with open(path) as f:
+        products = json.load(f)
+    print(f"[stream] Loaded {len(products)} popular products for cold-start fallback.")
+    return products
+
+
+def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: ALSModel,
+                        popular_products: list):
     """
     Return a foreachBatch function that closes over the pre-loaded models.
     Models are loaded once at startup instead of on every micro-batch.
+
+    For each micro-batch:
+      - Known users (in ALS training set): recs already in PostgreSQL from train.py;
+        this job refreshes them via recommendForUserSubset.
+      - Cold-start users (not in training set): handleInvalid='skip' drops them
+        from the ALS path; they receive popular-product fallbacks instead.
     """
     # Build the product reverse-map once (label index → raw product ID string)
     product_labels   = encoder.stages[1].labels
@@ -73,72 +113,112 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
     product_map.cache()
 
     user_indexer = encoder.stages[0]
+    # Set of all raw user IDs seen during training (for cold-start detection)
+    known_user_set: set = set(encoder.stages[0].labels)
 
     def write_recommendations(batch_df, batch_id):
-        """Micro-batch handler: encode new users, generate Top-N, upsert to Postgres."""
+        """Micro-batch handler: route known users to ALS, cold-start to popular products."""
         if batch_df.rdd.isEmpty():
             return
 
-        # Encode unique user IDs seen in this batch
-        encoded = user_indexer.transform(
-            batch_df.select(col("UserId").alias("raw_user")).dropDuplicates(["raw_user"])
-        ).select(col("userId").cast("int"), col("raw_user"))
-
-        # ALS recommendForUserSubset
-        user_subset = encoded.select(col("userId"))
-        recs        = als_model.recommendForUserSubset(user_subset, TOP_N)
-
-        exploded = recs.select(
-            col("userId"),
-            posexplode(col("recommendations")).alias("rank", "rec"),
-        ).select(
-            col("userId"),
-            (col("rank") + 1).alias("rank"),
-            col("rec.productId").alias("productId"),
-            col("rec.rating").alias("predicted_rating"),
+        # All unique users seen in this micro-batch
+        users_in_batch = (
+            batch_df.select(col("UserId").alias("raw_user"))
+            .dropDuplicates(["raw_user"])
+            .rdd.flatMap(lambda x: x)
+            .collect()
         )
 
-        user_map = encoded.select(col("userId"), col("raw_user"))
+        # Split into known (in training set) vs cold-start (never seen)
+        known_users    = [u for u in users_in_batch if u in known_user_set]
+        coldstart_users = [u for u in users_in_batch if u not in known_user_set]
 
-        result = (
-            exploded
-            .join(user_map,    on="userId",    how="left")
-            .join(product_map, on="productId", how="left")
-            .select(
-                col("raw_user").alias("user_id"),
-                col("raw_product").alias("product_id"),
-                col("rank"),
-                col("predicted_rating"),
+        # ── Known users: refresh via ALS recommendForUserSubset ───────────────
+        if known_users:
+            known_df = spark.createDataFrame(
+                [(u,) for u in known_users], ["raw_user"]
             )
-        )
+            encoded = user_indexer.transform(known_df).select(
+                col("userId").cast("int"), col("raw_user")
+            )
+            user_subset = encoded.select(col("userId"))
+            recs        = als_model.recommendForUserSubset(user_subset, TOP_N)
 
-        # Upsert via staging table: write to temp, then INSERT ... ON CONFLICT DO UPDATE
-        staging = f"recs_staging_{batch_id}"
-        result.write.jdbc(url=JDBC_URL, table=staging, mode="overwrite", properties=JDBC_PROP)
+            exploded = recs.select(
+                col("userId"),
+                posexplode(col("recommendations")).alias("rank", "rec"),
+            ).select(
+                col("userId"),
+                (col("rank") + 1).alias("rank"),
+                col("rec.productId").alias("productId"),
+                col("rec.rating").alias("predicted_rating"),
+            )
 
-        conn = psycopg2.connect(
-            host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
-            user=_PG_USER, password=_PG_PASS
-        )
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    staging_id = pgsql.Identifier(staging)
-                    cur.execute(
-                        pgsql.SQL("""
-                            INSERT INTO recommendations (user_id, product_id, rank, predicted_rating)
-                            SELECT user_id, product_id, rank, predicted_rating FROM {}
-                            ON CONFLICT (user_id, product_id) DO UPDATE SET
-                                rank             = EXCLUDED.rank,
-                                predicted_rating = EXCLUDED.predicted_rating,
-                                created_at       = now()
-                        """).format(staging_id)
-                    )
-                    cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(staging_id))
-        finally:
-            conn.close()
+            result = (
+                exploded
+                .join(encoded.select("userId", "raw_user"), on="userId", how="left")
+                .join(product_map, on="productId", how="left")
+                .select(
+                    col("raw_user").alias("user_id"),
+                    col("raw_product").alias("product_id"),
+                    col("rank"),
+                    col("predicted_rating"),
+                )
+            )
 
-        print(f"[stream] Batch {batch_id}: upsert complete.")
+            staging = f"recs_staging_{batch_id}"
+            result.write.jdbc(url=JDBC_URL, table=staging, mode="overwrite", properties=JDBC_PROP)
+
+            conn = psycopg2.connect(
+                host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
+                user=_PG_USER, password=_PG_PASS
+            )
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        staging_id = pgsql.Identifier(staging)
+                        cur.execute(
+                            pgsql.SQL("""
+                                INSERT INTO recommendations (user_id, product_id, rank, predicted_rating)
+                                SELECT user_id, product_id, rank, predicted_rating FROM {}
+                                ON CONFLICT (user_id, product_id) DO UPDATE SET
+                                    rank             = EXCLUDED.rank,
+                                    predicted_rating = EXCLUDED.predicted_rating,
+                                    created_at       = now()
+                            """).format(staging_id)
+                        )
+                        cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(staging_id))
+            finally:
+                conn.close()
+
+        # ── Cold-start users: insert popular-product fallbacks ────────────────
+        if coldstart_users and popular_products:
+            conn = psycopg2.connect(
+                host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
+                user=_PG_USER, password=_PG_PASS
+            )
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        for user_id in coldstart_users:
+                            for rank, product_id in enumerate(popular_products, 1):
+                                cur.execute(
+                                    """
+                                    INSERT INTO recommendations
+                                        (user_id, product_id, rank, predicted_rating)
+                                    VALUES (%s, %s, %s, NULL)
+                                    ON CONFLICT (user_id, product_id) DO NOTHING
+                                    """,
+                                    (user_id, product_id, rank),
+                                )
+            finally:
+                conn.close()
+            print(f"[stream] Batch {batch_id}: popular-product fallback for "
+                  f"{len(coldstart_users)} cold-start user(s).")
+
+        if known_users or coldstart_users:
+            print(f"[stream] Batch {batch_id}: {len(known_users)} known, "
+                  f"{len(coldstart_users)} cold-start.")
 
     return write_recommendations
 
@@ -149,9 +229,10 @@ def run():
 
     print("[stream] Loading ALS model and encoders...")
     encoder, als_model = load_models()
+    popular_products   = load_popular_products()
     print("[stream] Models loaded. Starting streaming query...")
 
-    batch_handler = make_batch_handler(spark, encoder, als_model)
+    batch_handler = make_batch_handler(spark, encoder, als_model, popular_products)
 
     raw_stream = (
         spark.readStream

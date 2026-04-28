@@ -87,7 +87,7 @@ app.add_middleware(
 class RecommendationResponse(BaseModel):
     user_id:         str
     recommendations: List[str]
-    predicted_ratings: Optional[List[float]] = None
+    predicted_ratings: Optional[List[Optional[float]]] = None
 
 
 class MetricsResponse(BaseModel):
