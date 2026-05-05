@@ -181,7 +181,7 @@ def get_recommendations(
     return RecommendationResponse(
         user_id           = user_id,
         recommendations   = [r["product_id"] for r in rows],
-        predicted_ratings = [round(r["predicted_rating"], 3) if r["predicted_rating"] else None for r in rows],
+        predicted_ratings = [round(min(5.0, max(1.0, r["predicted_rating"])), 3) if r["predicted_rating"] else None for r in rows],
     )
 
 

@@ -31,7 +31,7 @@ from psycopg2 import sql as pgsql
 from pyspark.ml import PipelineModel
 from pyspark.ml.recommendation import ALSModel
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, posexplode
+from pyspark.sql.functions import coalesce, col, from_json, lit, posexplode
 from pyspark.sql.types import FloatType, LongType, StringType, StructField, StructType
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
@@ -72,10 +72,12 @@ def build_spark() -> SparkSession:
 
 
 def load_models():
-    """Load encoder pipeline and ALS model from the shared volume."""
+    """Load encoder pipeline, ALS model, and bias info from the shared volume."""
     encoder   = PipelineModel.load(f"{MODEL_PATH}/encoders")
     als_model = ALSModel.load(f"{MODEL_PATH}/als")
-    return encoder, als_model
+    with open(f"{MODEL_PATH}/metrics.json") as f:
+        global_mean = float(json.load(f).get("global_mean", 0.0))
+    return encoder, als_model, global_mean
 
 
 def load_popular_products() -> list:
@@ -95,7 +97,7 @@ def load_popular_products() -> list:
 
 
 def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: ALSModel,
-                        popular_products: list):
+                        global_mean: float, popular_products: list):
     """
     Return a foreachBatch function that closes over the pre-loaded models.
     Models are loaded once at startup instead of on every micro-batch.
@@ -111,6 +113,10 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
     product_map_rows = [(i, product_labels[i]) for i in range(len(product_labels))]
     product_map      = spark.createDataFrame(product_map_rows, ["productId", "raw_product"])
     product_map.cache()
+
+    # Load per-user and per-item biases saved by train.py
+    user_biases = spark.read.parquet(f"{MODEL_PATH}/user_biases").cache()
+    item_biases = spark.read.parquet(f"{MODEL_PATH}/item_biases").cache()
 
     user_indexer = encoder.stages[0]
     # Set of all raw user IDs seen during training (for cold-start detection)
@@ -157,12 +163,16 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
             result = (
                 exploded
                 .join(encoded.select("userId", "raw_user"), on="userId", how="left")
-                .join(product_map, on="productId", how="left")
+                .join(product_map,  on="productId", how="left")
+                .join(user_biases,  on="userId",    how="left")
+                .join(item_biases,  on="productId", how="left")
                 .select(
                     col("raw_user").alias("user_id"),
                     col("raw_product").alias("product_id"),
                     col("rank"),
-                    col("predicted_rating"),
+                    (col("predicted_rating") + lit(global_mean)
+                     + coalesce(col("user_bias"), lit(0.0))
+                     + coalesce(col("item_bias"), lit(0.0))).alias("predicted_rating"),
                 )
             )
 
@@ -228,11 +238,11 @@ def run():
     spark.sparkContext.setLogLevel("WARN")
 
     print("[stream] Loading ALS model and encoders...")
-    encoder, als_model = load_models()
-    popular_products   = load_popular_products()
-    print("[stream] Models loaded. Starting streaming query...")
+    encoder, als_model, global_mean = load_models()
+    popular_products                = load_popular_products()
+    print(f"[stream] Models loaded. Global mean: {global_mean:.4f}. Starting streaming query...")
 
-    batch_handler = make_batch_handler(spark, encoder, als_model, popular_products)
+    batch_handler = make_batch_handler(spark, encoder, als_model, global_mean, popular_products)
 
     raw_stream = (
         spark.readStream

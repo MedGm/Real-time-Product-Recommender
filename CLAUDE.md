@@ -1,161 +1,199 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with this repository.
 
 ## Project Overview
 
-Real-time product recommendation system using the Amazon Fine Food Reviews dataset (~568k reviews). The pipeline is: Kafka ingestion → Spark ALS training → Airflow orchestration → FastAPI + Nginx dashboard.
+Real-time product recommendation system using the Amazon Fine Food Reviews dataset (~568k reviews).
+Lambda-inspired pipeline: Kafka ingestion → Spark ALS training → Airflow orchestration → FastAPI + Nginx dashboard.
 
-Dataset: `dataset/Reviews.csv` — columns: `Id, ProductId, UserId, ProfileName, HelpfulnessNumerator, HelpfulnessDenominator, Score, Time, Summary, Text`. Only `UserId`, `ProductId`, `Score`, and `Time` are used by the pipeline.
+Dataset: `dataset/Reviews.csv` — columns: `Id, ProductId, UserId, ProfileName, HelpfulnessNumerator, HelpfulnessDenominator, Score, Time, Summary, Text`.
+Fields used by pipeline: `UserId`, `ProductId`, `Score`, `Time`, `HelpfulnessNumerator`, `HelpfulnessDenominator`.
 
-## Target Architecture
+## Architecture
 
 ```
 docker-compose.yml
-├── kafka + zookeeper          # event ingestion
-├── spark (master + 1 worker)  # ALS training + streaming
-├── airflow                    # orchestration (DAGs)
-├── postgres                   # store recommendations/results
-├── api (FastAPI)              # GET /recommendations/user/{id}
-└── dashboard (Nginx + HTML/JS) # interactive web UI (static, proxies /api/ to FastAPI)
+├── zookeeper + kafka          # event ingestion (amazon-reviews topic)
+├── kafka-init                 # creates topic; exits after completion
+├── spark-master + spark-worker# Spark cluster (UI at :8090)
+├── spark-stream               # always-on streaming inference service
+├── postgres                   # recommendations + model_runs tables
+├── airflow                    # orchestration — fully automated @once DAG
+├── api (FastAPI)              # REST API :8000
+├── dashboard (Nginx + HTML/JS)# static SPA :8501, proxies /api/ to FastAPI
+└── producer                   # profile: manual — run by Airflow DAG Task 1
 ```
 
-### Planned directory layout
+## Automated Pipeline (DAG: recommendation_pipeline)
+
+Schedule: `@once` — auto-runs on fresh stack start (`is_paused_upon_creation=False`).
+No manual trigger needed for fresh `down -v` + `up --build` restarts.
+
+### DAG Task Chain
 
 ```
-producer/          # Kafka producer that streams Reviews.csv rows
-spark/
-  jobs/
-    train.py       # batch: Kafka snapshot → clean → filter → ALS fit → save model
-    stream.py      # streaming: consume Kafka → apply frozen model → Top-N recs
-airflow/
-  dags/            # DAG that chains Kafka sensor → training → stream restart → metrics
-api/               # FastAPI app
-dashboard/         # Nginx + HTML/JS static dashboard
-docker-compose.yml
+Task 1: trigger_kafka_ingestion    — python3 /producer/producer.py (200k messages, DELAY_MS=0)
+Task 2: spark_batch_training       — spark-submit train.py (ALS 80/10/10)
+Task 3: restart_streaming_service  — docker restart spark-stream (reloads new model)
+Task 4: print_model_metrics        — reads /model/metrics.json, logs RMSE
 ```
+
+### Why producer is Task 1, not a Docker service
+
+Producer now runs as a synchronous DAG task. `DELAY_MS=0` sends 200k messages as fast as possible.
+After Task 1 exits, all messages are in Kafka — Task 2 reads a complete bounded snapshot.
+The `producer:` service in docker-compose.yml has `profiles: ["manual"]` so it does not auto-start.
+
+### Why spark-stream is always-on, not a DAG task
+
+Streaming inference never terminates. Making it a DAG task would block Airflow indefinitely.
+Task 3 issues `docker restart spark-stream` via the Docker socket so the service reloads the new model.
 
 ## Architecture Rationale (Lambda-inspired Split)
 
-### Kafka is the ingestion layer BEFORE training (not just streaming inference)
-
-The Kafka producer streams `Reviews.csv` row-by-row to the `amazon-reviews` topic.
-`train.py` reads a **bounded snapshot** from Kafka using `spark.read.format("kafka")`
-with `endingOffsets="latest"`. This materialises all accumulated messages into a
-static DataFrame before ALS training begins. ALS remains a pure batch algorithm.
-
-**Framing:** *"Kafka provides the streaming ingestion layer. The producer injects
-the historical dataset as a continuous event stream. When sufficient data has
-accumulated (≥ KAFKA_MIN_MSGS messages), Spark reads a bounded snapshot and trains
-ALS in batch. The streaming job then handles cold-start users via popular-product
-fallbacks."*
-
-> **Note on terminology:** This is a Lambda-inspired split (streaming ingestion +
-> batch training + streaming inference), not a full Lambda Architecture. Classic
-> Lambda Architecture also requires a separate serving layer that merges batch and
-> speed layer outputs. Use "Lambda-inspired" in the report.
-
-### `spark.read` vs `spark.readStream`
+`train.py` uses `spark.read.format("kafka")` with `endingOffsets="latest"` — **bounded snapshot**.
+`stream.py` uses `spark.readStream.format("kafka")` — **unbounded stream**, runs forever.
 
 | | `train.py` | `stream.py` |
 |--|--|--|
-| Spark API | `spark.read.format("kafka")` | `spark.readStream.format("kafka")` |
-| Bounded? | ✅ Yes — stops at `endingOffsets: latest` | ❌ No — runs forever |
+| Spark API | `spark.read` | `spark.readStream` |
+| Bounded? | Yes — stops at latest offset | No — runs forever |
 | Role | Snapshot → train ALS | New events → apply frozen ALS |
 
-### Why spark-stream is always-on in Docker Compose, not a DAG task
+## Data Preprocessing Pipeline (train.py)
 
-The streaming inference job is a long-running process that never terminates.
-Making it a DAG task would block Airflow indefinitely. Docker Compose keeps it
-alive with `restart: unless-stopped`. After each training run, Airflow's
-`restart_streaming_service` task issues `docker restart spark-stream` so the
-service reloads the newly saved model.
+### 1. Kafka ingestion
+- Reads bounded snapshot from `amazon-reviews` topic
+- Parses JSON: `{UserId, ProductId, Score, Time, HelpfulnessNumerator, HelpfulnessDenominator}`
 
-### Why the producer is not a DAG task
+### 2. Cleaning & filtering
+- Drop nulls on `[raw_user, raw_product, rating]`
+- Filter `rating ∈ [1, 5]`
+- **Helpfulness filter**: keep reviews with `h_den == 0` (unvoted) OR `h_num/h_den >= 0.6`
+  - Removes ~15% of reviews the community flagged as unhelpful
+- Deduplicate on `(raw_user, raw_product)` — one rating per user-product pair
+- Activity filter: `MIN_USER_RATINGS=3`, `MIN_PRODUCT_RATINGS=3`
 
-The producer streams CSV row-by-row at a configurable rate (DELAY_MS).
-Tying it to a DAG task would require waiting for it to finish before training,
-defeating streaming semantics. The Airflow sensor `wait_for_kafka_messages`
-gates the pipeline on ≥ MAX_ROWS messages being present in the topic.
+### 3. String encoding
+- `StringIndexer` maps `UserId` → integer `userId`, `ProductId` → integer `productId`
+- Encoder pipeline saved to `/model/encoders`
 
-## Data splits
+### 4. Bias decomposition
+- Decompose: `r = μ + b_u + b_i + ε`
+- Compute `global_mean μ`, per-user bias `b_u`, per-item bias `b_i`
+- ALS trains on **residuals** `ε = r − μ − b_u − b_i`
+- Biases saved to `/model/user_biases/` and `/model/item_biases/` (parquet)
+- At inference: `predicted_rating = ε_pred + μ + b_u + b_i`
+- Expected RMSE gain over raw ALS: −0.2 to −0.4
 
-- **80%** training, **10%** validation/hyperparameter tuning, **10%** held-out test (never seen during training).
-- ALS evaluation metric: **RMSE**.
+### 5. ALS training (80/10/10 split)
+- `TrainValidationSplit` (Spark MLlib tuning API, `trainRatio=0.8`, `parallelism=2`)
+- Hyperparameter grid: `rank ∈ {20,50,100}`, `regParam ∈ {0.05,0.1}`, `maxIter=15` → 6 combinations
+- Best params found: `rank=100, regParam=0.05, maxIter=15`
+- `coldStartStrategy="drop"`, `nonnegative=False` (residuals can be negative)
+- **Achieved RMSE: val=0.566, test=0.557**
 
-## Key implementation details
-
-### Kafka topic
-- Topic name: `amazon-reviews`
-- Message schema: `{"UserId": str, "ProductId": str, "Score": float, "Time": int}`
-
-### Spark ALS (`pyspark.ml.recommendation.ALS`)
-- UserId and ProductId must be integer-encoded before ALS (map string IDs to sequential ints).
-- Save the trained model to a shared volume so the streaming job and API can load it.
-- `coldStartStrategy="drop"` to avoid NaN RMSE on unknown users/items.
-
-### Airflow DAG execution order
-1. `wait_for_kafka_messages`   — sensor polls until ≥ `KAFKA_MIN_MSGS` messages (default 10 000; separate from `MAX_ROWS`)
-2. `spark_batch_training`       — `spark-submit train.py` (reads Kafka bounded snapshot, trains ALS, writes all recs to PostgreSQL)
-3. `restart_streaming_service`  — `docker restart spark-stream` via Docker socket (cold-start handler reloads popular products)
-4. `print_model_metrics`        — reads `/model/metrics.json`, logs RMSE to Airflow
-
-> **Docker socket security:** `restart_streaming_service` mounts `/var/run/docker.sock`
-> into Airflow, giving it access to the host Docker daemon. This is acceptable for a
-> local demo. In production, replace with a Kubernetes Job, Docker API with scoped
-> permissions, or a deployment controller.
-
-### API contract
+### 6. Output artifacts
 ```
-GET /recommendations/user/{user_id}?n=10
-→ {"user_id": "...", "recommendations": ["ProductId1", ...]}
+/model/
+  als/              — saved ALSModel
+  encoders/         — saved PipelineModel (StringIndexers)
+  user_biases/      — parquet: (userId int, user_bias double)
+  item_biases/      — parquet: (productId int, item_bias double)
+  test_data/        — parquet: held-out 10% (never seen during training)
+  metrics.json      — RMSE values, best params, global_mean, timestamps
+  popular_products.json — Top-N most-reviewed products (cold-start fallback)
+  stream_checkpoint/    — Spark Structured Streaming checkpoint
 ```
 
-## Docker Compose
+## Kafka Message Schema
 
-Launch the full stack:
-```bash
-docker compose up --build
+```json
+{
+  "UserId": "A3SGXH7AUHU8GW",
+  "ProductId": "B001E4KFG0",
+  "Score": 4.0,
+  "Time": 1346976000,
+  "HelpfulnessNumerator": 1,
+  "HelpfulnessDenominator": 1
+}
 ```
 
-Tear down and remove volumes:
-```bash
-docker compose down -v
-```
+## Streaming Inference (stream.py)
 
-Rebuild a single service (e.g., after editing `api/`):
-```bash
-docker compose up --build api
-```
+Loads at startup: encoder, ALSModel, `global_mean` (from metrics.json), `user_biases`, `item_biases` (parquet).
 
-## Spark jobs (inside the spark-master container)
+Per 30-second micro-batch:
+1. Extract unique users from batch
+2. **Known users** (in training set): ALS `recommendForUserSubset` → apply bias correction → upsert to postgres
+3. **Cold-start users** (not in training): insert popular-product fallbacks with `ON CONFLICT DO NOTHING`
 
-Submit batch training (reads Kafka snapshot):
-```bash
-docker compose exec airflow spark-submit \
-  --master local[*] \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.3 \
-  /jobs/train.py
-```
+Bias correction in stream: `predicted_rating = als_residual + global_mean + user_bias + item_bias`
 
-Submit streaming job (long-running — normally runs as spark-stream service):
-```bash
-docker compose exec spark-master spark-submit \
-  --master local[2] \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.3 \
-  /jobs/stream.py
-```
+## Airflow DAG Details
 
-## Airflow
+- `schedule_interval='@once'`, `is_paused_upon_creation=False`
+- `start_date=datetime(2024, 1, 1)` — in the past, so runs immediately on scheduler start
+- `catchup=False` — does not backfill
+- Producer task env: `DELAY_MS=0, MAX_ROWS=200000`
+- Training task env: `MIN_USER_RATINGS=3, MIN_PRODUCT_RATINGS=3`
+- `execution_timeout`: 2h for ingestion, 3h for training
+- Docker socket mounted in Airflow for `docker restart spark-stream`
 
-Access the UI at `http://localhost:8080` (default credentials: `airflow` / `airflow`).
-
-Trigger the main DAG manually:
+To retrain manually:
 ```bash
 docker compose exec airflow airflow dags trigger recommendation_pipeline
 ```
 
-## API & Dashboard
+## API Contract
 
-- API: `http://localhost:8000` — docs at `/docs`
-- Dashboard (Nginx HTML/JS): `http://localhost:8501`
+```
+GET /recommendations/user/{user_id}?n=10
+→ {"user_id": "...", "recommendations": ["B001E4KFG0", ...], "predicted_ratings": [4.23, ...]}
+
+GET /metrics
+→ {"val_rmse": 0.566, "test_rmse": 0.557, "best_params": {...}, "global_mean": 4.18, ...}
+
+GET /pipeline-status
+→ {"model_ready": true, "val_rmse": 0.566, "unique_users": 11751, ...}
+
+GET /stats
+→ {"users_with_recommendations": 11751, "total_recommendation_rows": 117510}
+
+GET /users?limit=100
+→ {"users": ["A3SGXH7AUHU8GW", ...]}
+```
+
+## Docker Compose
+
+```bash
+# Full fresh start (pipeline runs automatically)
+docker compose down -v && docker compose up --build
+
+# Rebuild single service
+docker compose up --build api
+
+# Manual producer (bypasses DAG)
+docker compose --profile manual up producer
+```
+
+## Key Environment Variables
+
+| Variable | Default | Where |
+|----------|---------|-------|
+| `MAX_ROWS` | `200000` | producer task / DAG |
+| `DELAY_MS` | `0` | producer task (DAG), `5` in manual profile |
+| `MIN_USER_RATINGS` | `3` | train.py via DAG env |
+| `MIN_PRODUCT_RATINGS` | `3` | train.py via DAG env |
+| `TOP_N` | `10` | stream.py, train.py |
+
+## Service URLs
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| Dashboard | http://localhost:8501 | — |
+| Airflow | http://localhost:8080 | airflow / airflow |
+| FastAPI docs | http://localhost:8000/docs | — |
+| Spark UI | http://localhost:8090 | — |
+| PostgreSQL | localhost:5433 | bigdata / bigdata |

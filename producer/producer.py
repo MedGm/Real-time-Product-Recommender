@@ -52,11 +52,15 @@ def stream(producer: KafkaProducer) -> None:
         for row in reader:
             if MAX_ROWS and sent >= MAX_ROWS:
                 break
+            h_num = row.get("HelpfulnessNumerator", "") or "0"
+            h_den = row.get("HelpfulnessDenominator", "") or "0"
             msg = {
-                "UserId":    row["UserId"],
-                "ProductId": row["ProductId"],
-                "Score":     float(row["Score"]),
-                "Time":      int(row["Time"]),
+                "UserId":                 row["UserId"],
+                "ProductId":              row["ProductId"],
+                "Score":                  float(row["Score"]),
+                "Time":                   int(row["Time"]),
+                "HelpfulnessNumerator":   int(h_num),
+                "HelpfulnessDenominator": int(h_den),
             }
             producer.send(KAFKA_TOPIC, value=msg)
             sent += 1

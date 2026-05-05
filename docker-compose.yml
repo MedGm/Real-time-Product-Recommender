@@ -202,8 +202,8 @@ services:
       SPARK_MASTER: spark://spark-master:7077
       KAFKA_BOOTSTRAP: kafka:29092
       KAFKA_TOPIC: amazon-reviews
-      MAX_ROWS: "50000"          # used by KafkaTopicSensor threshold
-      KAFKA_MIN_MSGS: "10000"    # sensor triggers training once this many msgs exist (≤ MAX_ROWS)
+      MAX_ROWS: "200000"         # matches producer MAX_ROWS
+      KAFKA_MIN_MSGS: "150000"   # sensor waits for 150k msgs before training (producer sends 200k)
       PYSPARK_PYTHON: python3
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -215,6 +215,8 @@ services:
       - ./airflow/dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs
       - ./spark/jobs:/jobs
+      - ./producer:/producer:ro                     # producer.py run as DAG task
+      - ./dataset:/dataset:ro                       # Reviews.csv for producer task
       - spark_model:/model
     ports:
       - "8080:8080"
@@ -228,14 +230,13 @@ services:
 
   # ─────────────────────────────────────────
   # Kafka Producer
-  # Streams Reviews.csv row-by-row to the Kafka topic.
-  # Exits cleanly after MAX_ROWS messages (or full dataset).
-  # restart: on-failure retries if it crashes mid-stream.
+  # Airflow DAG Task 1 runs producer.py directly — no auto-start.
+  # Profile "manual" keeps it available for standalone testing only.
   # ─────────────────────────────────────────
   producer:
     build: ./producer
     container_name: producer
-    restart: on-failure
+    profiles: ["manual"]
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -243,8 +244,8 @@ services:
       KAFKA_BOOTSTRAP: kafka:29092
       KAFKA_TOPIC: amazon-reviews
       CSV_PATH: /dataset/Reviews.csv
-      DELAY_MS: 10        # ms between messages (adjust speed)
-      MAX_ROWS: 50000     # 0 = full dataset
+      DELAY_MS: 5
+      MAX_ROWS: 200000
     volumes:
       - ./dataset:/dataset:ro
     networks: [bigdata]
