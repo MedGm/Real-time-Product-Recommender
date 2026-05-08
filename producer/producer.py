@@ -61,6 +61,7 @@ def stream(producer: KafkaProducer) -> None:
                 "Time":                   int(row["Time"]),
                 "HelpfulnessNumerator":   int(h_num),
                 "HelpfulnessDenominator": int(h_den),
+                "Summary":                (row.get("Summary") or "")[:120],
             }
             producer.send(KAFKA_TOPIC, value=msg)
             sent += 1

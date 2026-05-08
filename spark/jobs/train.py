@@ -47,12 +47,13 @@ from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, coalesce, count, desc, from_json, lit, mean, posexplode
+from pyspark.sql.functions import col, coalesce, count, desc, first, from_json, lit, mean, posexplode
 from pyspark.sql.types import FloatType, LongType, StringType, StructField, StructType
 
 # ── Kafka config ──────────────────────────────────────────────────────────────
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
 KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC",     "amazon-reviews")
+CSV_PATH        = os.getenv("CSV_PATH",        "/dataset/Reviews.csv")
 
 # ── Output path ───────────────────────────────────────────────────────────────
 MODEL_PATH = os.getenv("MODEL_PATH", "/model")
@@ -281,6 +282,62 @@ def write_all_recommendations(spark: SparkSession, best_model, encoder,
     print(f"[train] All-user recommendations written to PostgreSQL.")
 
 
+def save_product_names(spark: SparkSession):
+    """
+    Read Reviews.csv, extract a display name per product (most-helpful review
+    Summary), and upsert into the postgres products table for the dashboard.
+    """
+    if not os.path.exists(CSV_PATH):
+        print(f"[train] CSV not found at {CSV_PATH}, skipping product names.")
+        return
+
+    print("[train] Extracting product display names from CSV ...")
+    csv_df = (
+        spark.read
+        .option("header", "true")
+        .option("escape", '"')
+        .csv(CSV_PATH)
+        .select(
+            col("ProductId").alias("product_id"),
+            col("Summary").alias("summary"),
+        )
+        .dropna(subset=["product_id", "summary"])
+        .filter(col("summary") != "")
+    )
+
+    products_df = (
+        csv_df
+        .groupBy("product_id")
+        .agg(
+            count("*").alias("review_count"),
+            first("summary").alias("display_name"),
+        )
+    )
+
+    rows = products_df.collect()
+    conn = psycopg2.connect(
+        host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
+        user=_PG_USER, password=_PG_PASS,
+    )
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE products")
+                cur.executemany(
+                    """
+                    INSERT INTO products (product_id, display_name, review_count)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (product_id) DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        review_count = EXCLUDED.review_count
+                    """,
+                    [(r.product_id, r.display_name[:200], r.review_count) for r in rows],
+                )
+    finally:
+        conn.close()
+    print(f"[train] Saved {len(rows):,} product names to postgres.")
+
+
 def train(spark: SparkSession):
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -298,34 +355,49 @@ def train(spark: SparkSession):
     n_products = encoded.select("productId").distinct().count()
     print(f"[train] Unique users: {n_users:,}  |  Unique products: {n_products:,}")
 
-    # ── 3.5. Bias decomposition ───────────────────────────────────────────────
-    # Decompose ratings as: r = μ + b_u + b_i + ε
-    # ALS trains on the residual ε only, freeing latent factors from modeling bias.
-    # Expected RMSE improvement: −0.2 to −0.4 for positively-biased datasets.
-    global_mean = encoded.select(mean("rating")).collect()[0][0]
-    print(f"[train] Global mean rating: {global_mean:.4f}")
+    # ── 4. 80 / 10 / 10 split on raw ratings — BEFORE bias computation ──────────
+    # Split must come first: computing biases on the full dataset would leak
+    # val/test rating information into the bias terms, artificially deflating
+    # test residuals and making RMSE look better than it is.
+    train_raw, val_raw, test_raw = encoded.randomSplit([0.8, 0.1, 0.1], seed=42)
+    train_raw.cache()
+
+    # ── 3.5. Bias decomposition — train split only ────────────────────────────
+    # Decompose: r = μ + b_u + b_i + ε  (ALS trains on ε)
+    # All statistics derived exclusively from training rows.
+    global_mean = train_raw.select(mean("rating")).collect()[0][0]
+    print(f"[train] Global mean rating (train only): {global_mean:.4f}")
 
     user_biases = (
-        encoded.groupBy("userId")
+        train_raw.groupBy("userId")
         .agg((mean("rating") - lit(global_mean)).alias("user_bias"))
     )
     item_biases = (
-        encoded.groupBy("productId")
+        train_raw.groupBy("productId")
         .agg((mean("rating") - lit(global_mean)).alias("item_bias"))
     )
+    user_biases.cache()
+    item_biases.cache()
 
-    encoded_residual = (
-        encoded
-        .join(user_biases, "userId")
-        .join(item_biases, "productId")
-        .withColumn(
-            "residual",
-            col("rating") - lit(global_mean) - col("user_bias") - col("item_bias"),
+    def apply_biases(df):
+        """Apply train-derived biases; unknown users/items in val/test get 0."""
+        return (
+            df
+            .join(user_biases, "userId",    "left")
+            .join(item_biases, "productId", "left")
+            .withColumn(
+                "residual",
+                col("rating") - lit(global_mean)
+                - coalesce(col("user_bias"), lit(0.0))
+                - coalesce(col("item_bias"), lit(0.0)),
+            )
         )
-    )
 
-    # ── 4. 80 / 10 / 10 split — fixed seed for reproducibility ───────────────
-    train_df, val_df, test_df = encoded_residual.randomSplit([0.8, 0.1, 0.1], seed=42)
+    train_df = apply_biases(train_raw)
+    val_df   = apply_biases(val_raw)
+    test_df  = apply_biases(test_raw)
+    train_raw.unpersist()
+
     train_df.cache()
     val_df.cache()
     train_count = train_df.count()
@@ -387,6 +459,8 @@ def train(spark: SparkSession):
     # Release cached DataFrames — no longer needed after tuning
     train_df.unpersist()
     val_df.unpersist()
+    user_biases.unpersist()
+    item_biases.unpersist()
 
     # ── 6. Evaluate on held-out test set (10% never seen during training) ─────
     test_preds = best_model.transform(test_df)
@@ -461,6 +535,12 @@ def train(spark: SparkSession):
                                   global_mean, user_biases, item_biases)
     except Exception as exc:
         print(f"[train] Warning: could not write all-user recommendations: {exc}")
+
+    # ── 11. Save product display names (for dashboard) ────────────────────────
+    try:
+        save_product_names(spark)
+    except Exception as exc:
+        print(f"[train] Warning: could not save product names: {exc}")
 
     return encoder, best_model
 

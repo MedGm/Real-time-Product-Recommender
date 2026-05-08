@@ -2,33 +2,45 @@
 FastAPI — recommendations service.
 
 Endpoints:
-  GET /health
-  GET /pipeline-status                        — model training status
-  GET /recommendations/user/{user_id}?n=10    — Top-N product IDs
-  GET /users?limit=100                        — sample of indexed users
-  GET /metrics                                — last model RMSE + params
-  GET /stats                                  — aggregate counts
+  GET  /health                              — liveness probe
+  GET  /health/all                          — detailed component health
+  GET  /pipeline-status                     — model training status
+  GET  /recommendations/user/{user_id}?n=10 — Top-N product IDs + names
+  GET  /users?limit=100                     — sample of indexed users
+  GET  /users/{user_id}/profile             — user bias, avg rating, rec count
+  GET  /metrics                             — last model RMSE + params
+  GET  /stats                               — aggregate counts
+  GET  /products/{product_id}               — product display name
+  GET  /dataset/ratings                     — rating distribution for EDA panel
+  GET  /feed                                — SSE live Kafka event stream
 """
 
+import asyncio
+import glob
 import json
 import os
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 DB_URL     = os.getenv("DB_URL", "postgresql://bigdata:bigdata@postgres/recommendations")
 MODEL_PATH = os.getenv("MODEL_PATH", "/model")
 
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
+KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "amazon-reviews")
+
 # ── Connection pool ───────────────────────────────────────────────────────────
 
 _pool: Optional[pg_pool.SimpleConnectionPool] = None
+
 
 def get_pool() -> pg_pool.SimpleConnectionPool:
     global _pool
@@ -37,7 +49,7 @@ def get_pool() -> pg_pool.SimpleConnectionPool:
             try:
                 _pool = pg_pool.SimpleConnectionPool(1, 20, DB_URL)
                 break
-            except psycopg2.OperationalError as e:
+            except psycopg2.OperationalError:
                 print(f"Waiting for postgres... attempt {attempt + 1}/10")
                 time.sleep(3)
         else:
@@ -47,7 +59,6 @@ def get_pool() -> pg_pool.SimpleConnectionPool:
 
 @contextmanager
 def get_conn():
-    """Context manager that borrows a connection from the pool and returns it."""
     conn = get_pool().getconn()
     try:
         yield conn
@@ -59,10 +70,8 @@ def get_conn():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Warm up the connection pool on startup
     get_pool()
     yield
-    # Close all connections on shutdown
     if _pool:
         _pool.closeall()
 
@@ -70,7 +79,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title       = "Real-Time Product Recommender API",
     description = "Amazon Fine Food Reviews · Spark ALS · Big Data Pipeline",
-    version     = "2.0.0",
+    version     = "3.0.0",
     lifespan    = lifespan,
 )
 
@@ -84,16 +93,24 @@ app.add_middleware(
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
+class RecommendationItem(BaseModel):
+    rank:             int
+    product_id:       str
+    display_name:     Optional[str] = None
+    predicted_rating: Optional[float] = None
+
+
 class RecommendationResponse(BaseModel):
     user_id:         str
-    recommendations: List[str]
-    predicted_ratings: Optional[List[Optional[float]]] = None
+    is_cold_start:   bool
+    recommendations: List[RecommendationItem]
 
 
 class MetricsResponse(BaseModel):
     val_rmse:        float
     test_rmse:       float
     best_params:     dict
+    global_mean:     Optional[float] = None
     trained_at:      Optional[str] = None
     finished_at:     Optional[str] = None
     train_rows:      Optional[int] = None
@@ -103,14 +120,54 @@ class MetricsResponse(BaseModel):
 
 class PipelineStatus(BaseModel):
     model_config = {"protected_namespaces": ()}
-    model_ready:    bool
-    trained_at:     Optional[str] = None
-    finished_at:    Optional[str] = None
-    val_rmse:       Optional[float] = None
-    test_rmse:      Optional[float] = None
-    train_rows:     Optional[int] = None
-    unique_users:   Optional[int] = None
+    model_ready:     bool
+    trained_at:      Optional[str] = None
+    finished_at:     Optional[str] = None
+    val_rmse:        Optional[float] = None
+    test_rmse:       Optional[float] = None
+    train_rows:      Optional[int] = None
+    unique_users:    Optional[int] = None
     unique_products: Optional[int] = None
+
+
+class UserProfile(BaseModel):
+    user_id:       str
+    is_known:      bool
+    rec_count:     int
+    avg_predicted: Optional[float] = None
+
+
+class ComponentHealth(BaseModel):
+    name:   str
+    status: str
+    detail: str
+
+
+class HealthAll(BaseModel):
+    overall:    str
+    components: List[ComponentHealth]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _load_metrics() -> Optional[dict]:
+    try:
+        with open(f"{MODEL_PATH}/metrics.json") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def _lookup_product_names(product_ids: List[str]) -> dict:
+    if not product_ids:
+        return {}
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT product_id, display_name FROM products WHERE product_id = ANY(%s)",
+                (product_ids,),
+            )
+            return {r[0]: r[1] for r in cur.fetchall()}
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -120,23 +177,85 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/health/all", response_model=HealthAll)
+def health_all():
+    components: List[ComponentHealth] = []
+
+    # Postgres
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM recommendations")
+                rows = cur.fetchone()[0]
+        components.append(ComponentHealth(
+            name="postgres", status="healthy",
+            detail=f"{rows:,} recommendation rows",
+        ))
+    except Exception as e:
+        components.append(ComponentHealth(name="postgres", status="offline", detail=str(e)))
+
+    # Kafka
+    try:
+        from kafka import KafkaConsumer
+        from kafka.structs import TopicPartition
+        consumer   = KafkaConsumer(bootstrap_servers=KAFKA_BOOTSTRAP)
+        partitions = consumer.partitions_for_topic(KAFKA_TOPIC) or set()
+        tps        = [TopicPartition(KAFKA_TOPIC, p) for p in partitions]
+        total      = sum(consumer.end_offsets(tps).values()) if tps else 0
+        consumer.close()
+        components.append(ComponentHealth(
+            name="kafka", status="healthy",
+            detail=f"{total:,} messages in {KAFKA_TOPIC}",
+        ))
+    except Exception as e:
+        components.append(ComponentHealth(name="kafka", status="offline", detail=str(e)))
+
+    # Model / Spark training
+    m = _load_metrics()
+    if m:
+        components.append(ComponentHealth(
+            name="spark_training", status="healthy",
+            detail=f"test RMSE {m.get('test_rmse', 0):.4f} · finished {m.get('finished_at', '?')[:10]}",
+        ))
+    else:
+        components.append(ComponentHealth(
+            name="spark_training", status="degraded",
+            detail="metrics.json not found — training not yet complete",
+        ))
+
+    # Spark streaming (checkpoint recency)
+    checkpoint = f"{MODEL_PATH}/stream_checkpoint"
+    try:
+        files = glob.glob(f"{checkpoint}/**/*", recursive=True)
+        if files:
+            latest = max(os.path.getmtime(f) for f in files if os.path.isfile(f))
+            age_s  = int(time.time() - latest)
+            status = "healthy" if age_s < 120 else "degraded"
+            components.append(ComponentHealth(
+                name="spark_streaming", status=status,
+                detail=f"last checkpoint {age_s}s ago",
+            ))
+        else:
+            components.append(ComponentHealth(
+                name="spark_streaming", status="degraded",
+                detail="no checkpoint yet",
+            ))
+    except Exception as e:
+        components.append(ComponentHealth(name="spark_streaming", status="offline", detail=str(e)))
+
+    overall = (
+        "healthy" if all(c.status == "healthy" for c in components) else
+        "offline" if any(c.status == "offline"  for c in components) else
+        "degraded"
+    )
+    return HealthAll(overall=overall, components=components)
+
+
 @app.get("/pipeline-status", response_model=PipelineStatus)
 def pipeline_status():
-    """Reports whether the ALS model has been trained and is ready."""
-    metrics_file = f"{MODEL_PATH}/metrics.json"
-    if not os.path.exists(metrics_file):
-        return PipelineStatus(
-            model_ready    = False,
-            trained_at     = None,
-            finished_at    = None,
-            val_rmse       = None,
-            test_rmse      = None,
-            train_rows     = None,
-            unique_users   = None,
-            unique_products = None,
-        )
-    with open(metrics_file) as f:
-        m = json.load(f)
+    m = _load_metrics()
+    if not m:
+        return PipelineStatus(model_ready=False)
     return PipelineStatus(
         model_ready     = True,
         trained_at      = m.get("trained_at"),
@@ -158,7 +277,7 @@ def get_recommendations(
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
                 """
-                SELECT product_id, predicted_rating
+                SELECT product_id, predicted_rating, rank
                 FROM   recommendations
                 WHERE  user_id = %s
                 ORDER  BY rank
@@ -169,25 +288,31 @@ def get_recommendations(
             rows = cur.fetchall()
 
     if not rows:
-        raise HTTPException(
-            status_code = 404,
-            detail      = (
-                f"No recommendations found for user '{user_id}'. "
-                "The streaming job may not have processed this user yet — "
-                "ensure the Airflow DAG has completed training."
-            ),
+        raise HTTPException(status_code=404, detail=f"No recommendations for user '{user_id}'.")
+
+    is_cold_start = all(r["predicted_rating"] is None for r in rows)
+    product_ids   = [r["product_id"] for r in rows]
+    name_map      = _lookup_product_names(product_ids)
+
+    items = [
+        RecommendationItem(
+            rank             = r["rank"],
+            product_id       = r["product_id"],
+            display_name     = name_map.get(r["product_id"]),
+            predicted_rating = round(r["predicted_rating"], 3) if r["predicted_rating"] else None,
         )
+        for r in rows
+    ]
 
     return RecommendationResponse(
-        user_id           = user_id,
-        recommendations   = [r["product_id"] for r in rows],
-        predicted_ratings = [round(min(5.0, max(1.0, r["predicted_rating"])), 3) if r["predicted_rating"] else None for r in rows],
+        user_id         = user_id,
+        is_cold_start   = is_cold_start,
+        recommendations = items,
     )
 
 
 @app.get("/users")
 def list_users(limit: int = Query(default=100, ge=1, le=1000)):
-    """Return a sample of user IDs that have recommendations stored."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -198,28 +323,128 @@ def list_users(limit: int = Query(default=100, ge=1, le=1000)):
     return {"users": [r[0] for r in rows]}
 
 
+@app.get("/users/{user_id}/profile", response_model=UserProfile)
+def user_profile(user_id: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*), AVG(predicted_rating) FROM recommendations WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+    if not row or row[0] == 0:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found.")
+
+    rec_count, avg_pred = row
+    return UserProfile(
+        user_id       = user_id,
+        is_known      = avg_pred is not None,
+        rec_count     = rec_count,
+        avg_predicted = round(avg_pred, 3) if avg_pred else None,
+    )
+
+
+@app.get("/products/{product_id}")
+def get_product(product_id: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT display_name, review_count FROM products WHERE product_id = %s",
+                (product_id,),
+            )
+            row = cur.fetchone()
+    if not row:
+        return {"product_id": product_id, "display_name": None, "review_count": None}
+    return {"product_id": product_id, "display_name": row[0], "review_count": row[1]}
+
+
 @app.get("/metrics", response_model=MetricsResponse)
 def get_metrics():
-    metrics_file = f"{MODEL_PATH}/metrics.json"
-    try:
-        with open(metrics_file) as f:
-            m = json.load(f)
-        return MetricsResponse(**m)
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code = 404,
-            detail      = "Model metrics not available yet. Trigger the Airflow DAG first.",
-        )
+    m = _load_metrics()
+    if not m:
+        raise HTTPException(status_code=404, detail="Model metrics not available yet.")
+    valid = {k: v for k, v in m.items() if k in MetricsResponse.model_fields}
+    return MetricsResponse(**valid)
 
 
 @app.get("/stats")
 def get_stats():
-    """High-level stats: unique users indexed and total recommendation rows."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(DISTINCT user_id), COUNT(*) FROM recommendations")
             users, total = cur.fetchone()
     return {
-        "users_with_recommendations":  users,
-        "total_recommendation_rows":   total,
+        "users_with_recommendations": users,
+        "total_recommendation_rows":  total,
     }
+
+
+@app.get("/dataset/ratings")
+def dataset_ratings():
+    """Fixed EDA stats from Amazon Fine Food Reviews dataset."""
+    return {
+        "distribution": [
+            {"stars": 1, "count": 52268,  "pct": 9.2},
+            {"stars": 2, "count": 29769,  "pct": 5.2},
+            {"stars": 3, "count": 42640,  "pct": 7.5},
+            {"stars": 4, "count": 80655,  "pct": 14.2},
+            {"stars": 5, "count": 363122, "pct": 63.9},
+        ],
+        "total":            568454,
+        "global_mean":      4.18,
+        "median":           5.0,
+        "sparsity":         99.9971,
+        "unique_users":     256059,
+        "unique_products":  74258,
+    }
+
+
+@app.get("/feed")
+async def live_feed():
+    """Server-Sent Events stream of live Kafka messages."""
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            from kafka import KafkaConsumer
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers   = KAFKA_BOOTSTRAP,
+                auto_offset_reset   = "latest",
+                enable_auto_commit  = False,
+                value_deserializer  = lambda b: json.loads(b.decode("utf-8")),
+            )
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            return
+
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                # Run blocking poll in thread so event loop stays free
+                records = await loop.run_in_executor(
+                    None, lambda: consumer.poll(timeout_ms=1000, max_records=3)
+                )
+                for _tp, msgs in records.items():
+                    for msg in msgs:
+                        payload = {
+                            "user_id":    msg.value.get("UserId"),
+                            "product_id": msg.value.get("ProductId"),
+                            "score":      msg.value.get("Score"),
+                            "summary":    msg.value.get("Summary", ""),
+                            "ts":         msg.timestamp,
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        await asyncio.sleep(1.0)   # max 1 event/second per client
+                yield ": heartbeat\n\n"
+                # no extra sleep — run_in_executor already waited up to 1 s
+        finally:
+            consumer.close()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

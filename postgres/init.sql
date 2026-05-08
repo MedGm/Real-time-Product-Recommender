@@ -19,6 +19,16 @@ CREATE TABLE IF NOT EXISTS recommendations (
 CREATE INDEX IF NOT EXISTS idx_recs_user_id ON recommendations (user_id);
 
 -- ─────────────────────────────────────────────────────────────
+-- Product display names — populated by train.py from CSV summaries
+-- ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS products (
+    product_id    TEXT PRIMARY KEY,
+    display_name  TEXT,
+    review_count  INT
+);
+
+-- ─────────────────────────────────────────────────────────────
 -- Model training runs — stores metrics history
 -- ─────────────────────────────────────────────────────────────
 
