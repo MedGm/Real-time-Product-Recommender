@@ -281,4 +281,5 @@ services:
       - "8501:80"    # nginx serves dashboard; /api/ is reverse-proxied to FastAPI
     volumes:
       - ./dashboard/index.html:/usr/share/nginx/html/index.html:ro
+      - ./dashboard/logo_big_data.png:/usr/share/nginx/html/logo_big_data.png:ro
     networks: [bigdata]
