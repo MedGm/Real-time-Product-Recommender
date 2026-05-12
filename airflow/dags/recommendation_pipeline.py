@@ -1,33 +1,22 @@
 """
 DAG: recommendation_pipeline
 
-Fully automated pipeline — triggers on stack start (@once) with no manual
-intervention required.
+A fully automated orchestration pipeline designed to trigger on stack startup.
+This DAG handles the end-to-end flow from data ingestion to model deployment.
 
-Task chain:
-  1. trigger_kafka_ingestion  — runs producer.py to stream Reviews.csv into Kafka
-  2. spark_batch_training     — reads bounded Kafka snapshot, trains ALS 80/10/10,
-                                saves model + metrics.json to /model volume
-  3. restart_streaming_service— docker restart spark-stream so it reloads new model
-  4. print_model_metrics      — reads /model/metrics.json and logs RMSE to Airflow
+Pipeline Stages:
+    1. Kafka Ingestion      : Streams Review data from CSV into Kafka.
+    2. Batch Training       : Trains an ALS recommendation model using a Kafka snapshot.
+    3. Service Deployment   : Restarts the streaming service to load the new model.
+    4. Metrics Logging      : Extracts and logs model performance metrics (RMSE).
 
-Architecture (Lambda-inspired split):
-  Kafka is the streaming ingestion layer. The producer (Task 1) streams the dataset
-  row-by-row into the topic. train.py (Task 2) reads a *bounded* snapshot via
-  spark.read.format("kafka") — ALS remains a pure batch algorithm.
-  stream.py runs as an always-on service that applies the frozen model to new events.
+Architecture:
+    The system follows a Lambda-like architecture. Batch training (train.py) processes 
+    historical snapshots, while the streaming service (stream.py) provides real-time 
+    inference. Both layers share the same model volume for consistency.
 
-  spark.read      → bounded snapshot → static DataFrame → ALS training  (train.py)
-  spark.readStream→ unbounded stream → frozen model inference            (stream.py)
-
-Why spark-stream is always-on, not a DAG task:
-  The streaming job never terminates. Task 3 issues `docker restart spark-stream`
-  so the service reloads the newly saved model without being a long-running DAG task.
-
-Schedule: @once — runs automatically on the first stack start.
-  - Fresh stack (down -v + up --build): Airflow DB is empty → DAG runs immediately.
-  - Stack restart without volume wipe: Airflow DB records prior run → no duplicate run.
-  - To retrain manually: trigger via Airflow UI or `airflow dags trigger`.
+Schedule: 
+    @once - Executes automatically upon initial stack deployment.
 """
 
 from __future__ import annotations
@@ -40,10 +29,14 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
-KAFKA_BOOT  = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
-KAFKA_TOPIC = "amazon-reviews"
-MODEL_PATH  = "/model"
-JOBS_PATH   = "/jobs"
+# -----------------------------------------------------------------------------
+# Configuration & Constants
+# -----------------------------------------------------------------------------
+
+KAFKA_BOOT     = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
+KAFKA_TOPIC    = "amazon-reviews"
+MODEL_PATH     = "/model"
+JOBS_PATH      = "/jobs"
 
 SPARK_PACKAGES = (
     "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
@@ -58,86 +51,97 @@ SPARK_SUBMIT_TRAIN = (
     f"--conf spark.driver.memory=2g "
 )
 
-default_args = {
+DEFAULT_ARGS = {
     "owner":            "bigdata",
     "retries":          1,
     "retry_delay":      timedelta(minutes=5),
     "email_on_failure": False,
 }
 
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
 
 def _print_metrics(**context):
+    """Reads metrics from JSON and prints them to the Airflow task log."""
     metrics_file = f"{MODEL_PATH}/metrics.json"
+    
     with open(metrics_file) as f:
         m = json.load(f)
+        
     print("=" * 60)
     print(f"  Validation RMSE  : {m['val_rmse']:.4f}")
     print(f"  Test RMSE        : {m['test_rmse']:.4f}")
     print(f"  Best params      : {m['best_params']}")
+    
     if isinstance(m.get("train_rows"), int):
         print(f"  Training rows    : {m['train_rows']:,}")
+        
     print(f"  Unique users     : {m.get('unique_users', 'N/A')}")
     print(f"  Unique products  : {m.get('unique_products', 'N/A')}")
     print(f"  Finished at      : {m.get('finished_at', 'N/A')}")
     print("=" * 60)
 
+# -----------------------------------------------------------------------------
+# DAG Definition
+# -----------------------------------------------------------------------------
 
 with DAG(
-    dag_id                 = "recommendation_pipeline",
-    default_args           = default_args,
-    description            = "Auto: Kafka ingestion → Spark ALS training → streaming → metrics",
-    schedule_interval      = "@once",        # auto-runs once on fresh stack start
-    start_date             = datetime(2024, 1, 1),
-    catchup                = False,
-    is_paused_upon_creation= False,          # auto-unpause so DAG runs without manual intervention
-    tags                   = ["bigdata", "recommender"],
+    dag_id                  = "recommendation_pipeline",
+    default_args            = DEFAULT_ARGS,
+    description             = "Kafka Ingestion -> Spark ALS Training -> Streaming Deployment",
+    schedule_interval       = "@once",
+    start_date              = datetime(2024, 1, 1),
+    catchup                 = False,
+    is_paused_upon_creation = False,
+    tags                    = ["bigdata", "recommender"],
 ) as dag:
 
-    # ── Task 1: Kafka ingestion via producer.py ───────────────────────────────
-    # Runs producer.py directly inside the Airflow container (kafka-python is
-    # installed). DELAY_MS=0 → ingest at full speed, no artificial throttling.
-    # Task exits only after all MAX_ROWS messages are flushed to Kafka — training
-    # (Task 2) can then safely read a complete bounded snapshot.
+    # -- Stage 1: Kafka Ingestion --
+    # Ingests the dataset into Kafka at full speed (DELAY_MS=0).
     trigger_ingestion = BashOperator(
-        task_id      = "trigger_kafka_ingestion",
-        bash_command = "python3 /producer/producer.py",
+        task_id           = "trigger_kafka_ingestion",
+        bash_command      = "python3 /producer/producer.py",
         env = {
             "KAFKA_BOOTSTRAP": KAFKA_BOOT,
             "KAFKA_TOPIC":     KAFKA_TOPIC,
             "CSV_PATH":        "/dataset/Reviews.csv",
             "MAX_ROWS":        "200000",
-            "DELAY_MS":        "0",     # no throttle — ingest as fast as possible
+            "DELAY_MS":        "0",
         },
-        append_env      = True,
+        append_env        = True,
         execution_timeout = timedelta(hours=2),
     )
 
-    # ── Task 2: Spark ALS batch training (reads bounded Kafka snapshot) ───────
+    # -- Stage 2: Spark ALS Batch Training --
+    # Reads the Kafka snapshot and trains the Collaborative Filtering model.
     spark_train = BashOperator(
-        task_id      = "spark_batch_training",
-        bash_command = SPARK_SUBMIT_TRAIN + f"{JOBS_PATH}/train.py",
+        task_id           = "spark_batch_training",
+        bash_command      = SPARK_SUBMIT_TRAIN + f"{JOBS_PATH}/train.py",
         env = {
-            "KAFKA_BOOTSTRAP":      KAFKA_BOOT,
-            "KAFKA_TOPIC":          KAFKA_TOPIC,
-            "MODEL_PATH":           MODEL_PATH,
-            "MIN_USER_RATINGS":     "3",
-            "MIN_PRODUCT_RATINGS":  "3",
+            "KAFKA_BOOTSTRAP":     KAFKA_BOOT,
+            "KAFKA_TOPIC":         KAFKA_TOPIC,
+            "MODEL_PATH":          MODEL_PATH,
+            "MIN_USER_RATINGS":    "3",
+            "MIN_PRODUCT_RATINGS": "3",
         },
         append_env        = True,
         execution_timeout = timedelta(hours=3),
     )
 
-    # ── Task 3: Restart spark-stream to load the newly trained model ──────────
+    # -- Stage 3: Restart Streaming Service --
+    # Triggers a restart of the spark-stream container to hot-reload the new model.
     restart_stream = BashOperator(
-        task_id      = "restart_streaming_service",
-        bash_command = "docker restart spark-stream",
+        task_id           = "restart_streaming_service",
+        bash_command      = "docker restart spark-stream",
     )
 
-    # ── Task 4: Log RMSE metrics to Airflow ───────────────────────────────────
+    # -- Stage 4: Log Model Metrics --
+    # Parses the training output and logs performance results to the console.
     print_metrics = PythonOperator(
-        task_id         = "print_model_metrics",
-        python_callable = _print_metrics,
+        task_id           = "print_model_metrics",
+        python_callable   = _print_metrics,
     )
 
-    # ── Dependency chain ──────────────────────────────────────────────────────
+    # -- Pipeline Dependencies --
     trigger_ingestion >> spark_train >> restart_stream >> print_metrics
