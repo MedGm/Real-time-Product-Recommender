@@ -702,6 +702,7 @@ const translations = {
     page_analytics_title: "ALS Model Analytics",
     page_dataset_title: "Amazon Fine Food Reviews — EDA",
     page_health_title: "Pipeline Health",
+    training_history: "Training History",
   },
   fr: {
     section_live: "En Direct",
@@ -722,6 +723,7 @@ const translations = {
     page_analytics_title: "Analyses du Modèle ALS",
     page_dataset_title: "Avis Amazon Fine Food — EDA",
     page_health_title: "Santé du Pipeline",
+    training_history: "Historique d'Entraînement",
   }
 };
 
@@ -1176,15 +1178,60 @@ async function loadUserChips() {
 /* ████  ANALYTICS  ████ */
 let rmseChart = null, splitChart = null;
 
-async function renderAnalytics() {
+async function renderAnalytics(timestamp = null) {
   const el = document.getElementById('analytics-content');
-  if (!S.metrics) {
-    try { S.metrics = await apiFetch('/metrics'); S.globalMean = S.metrics.global_mean ?? 4.18; }
-    catch (e) { el.innerHTML = banner('warn', 'Model metrics not available. Run the Airflow DAG first.'); return; }
+  
+  // If no timestamp, try to load the latest metrics if not already in state
+  if (!timestamp && !S.metrics) {
+    try { 
+      S.metrics = await apiFetch('/metrics'); 
+      S.globalMean = S.metrics.global_mean ?? 4.18;
+    } catch (e) { 
+      el.innerHTML = banner('warn', 'Model metrics not available. Run the Airflow DAG first.'); 
+      return; 
+    }
   }
-  const m = S.metrics;
+
+  // Fetch training history to populate the selector
+  let history = [];
+  try {
+    history = await apiFetch('/metrics/history');
+    // Sort by finished_at descending (newest first)
+    history.sort((a, b) => new Date(b.finished_at) - new Date(a.finished_at));
+  } catch (e) {
+    console.warn("Could not load history", e);
+  }
+
+  // Determine which metrics to show
+  let m = S.metrics;
+  if (timestamp) {
+    try {
+      m = await apiFetch('/metrics', { timestamp });
+    } catch (e) {
+      el.innerHTML = banner('error', 'Could not load historical metrics: ' + e.message);
+      return;
+    }
+  }
+
+  if (!m) {
+    el.innerHTML = banner('warn', 'No metrics data found.');
+    return;
+  }
+
+  const t = translations[localStorage.getItem('lang') || 'en'] || translations.en;
 
   el.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px">
+      <div class="card-title" style="margin-bottom:0">${t.training_history}</div>
+      <select id="training-selector" onchange="renderAnalytics(this.value)" style="width:280px; padding:8px">
+        ${history.length ? history.map(run => `
+          <option value="${run.finished_at}" ${run.finished_at === m.finished_at ? 'selected' : ''}>
+            ${new Date(run.finished_at).toLocaleString()} (${run.test_rmse.toFixed(4)} RMSE)
+          </option>
+        `).join('') : `<option selected disabled>No history available</option>`}
+      </select>
+    </div>
+
     <div class="metric-grid">
       <div class="metric-card amber">
         <div class="metric-value">${m.val_rmse.toFixed(4)} <small>RMSE</small></div>
@@ -1234,6 +1281,7 @@ async function renderAnalytics() {
       </div>
     </div>`;
 
+  // Render Charts
   if (rmseChart) rmseChart.destroy();
   rmseChart = new Chart(document.getElementById('rmse-chart'), {
     type: 'bar',

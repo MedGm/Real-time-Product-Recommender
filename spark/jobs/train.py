@@ -493,6 +493,21 @@ def train(spark: SparkSession):
     with open(f"{MODEL_PATH}/metrics.json", "w") as fh:
         json.dump(metrics, fh, indent=2)
 
+    # -- Append to training history --
+    history_file = f"{MODEL_PATH}/metrics_history.json"
+    history = []
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, "r") as fh:
+                history = json.load(fh)
+        except Exception:
+            history = []
+    
+    history.append(metrics)
+    with open(history_file, "w") as fh:
+        json.dump(history, fh, indent=2)
+    print(f"[train] Metrics appended to {history_file}")
+
     # ── 8. Log model run to PostgreSQL ────────────────────────────────────────
     try:
         conn = psycopg2.connect(

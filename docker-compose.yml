@@ -259,9 +259,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     environment:
       DB_URL: postgresql://bigdata:bigdata@postgres/recommendations
     volumes:
+      - ./api/main.py:/app/main.py:ro
       - spark_model:/model:ro
     ports:
       - "8000:8000"
@@ -277,4 +279,6 @@ services:
     depends_on: [api]
     ports:
       - "8501:80"    # nginx serves dashboard; /api/ is reverse-proxied to FastAPI
+    volumes:
+      - ./dashboard/index.html:/usr/share/nginx/html/index.html:ro
     networks: [bigdata]

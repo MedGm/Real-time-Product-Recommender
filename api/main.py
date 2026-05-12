@@ -360,12 +360,41 @@ def get_product(product_id: str):
 
 
 @app.get("/metrics", response_model=MetricsResponse)
-def get_metrics():
+def get_metrics(timestamp: Optional[str] = None):
+    if timestamp:
+        history_file = f"{MODEL_PATH}/metrics_history.json"
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, "r") as f:
+                    history = json.load(f)
+                    # Find the run with the matching finished_at timestamp
+                    for run in history:
+                        if run.get("finished_at") == timestamp:
+                            valid = {k: v for k, v in run.items() if k in MetricsResponse.model_fields}
+                            return MetricsResponse(**valid)
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail=f"Metrics for timestamp {timestamp} not found.")
+
     m = _load_metrics()
     if not m:
         raise HTTPException(status_code=404, detail="Model metrics not available yet.")
     valid = {k: v for k, v in m.items() if k in MetricsResponse.model_fields}
     return MetricsResponse(**valid)
+
+
+@app.get("/metrics/history")
+def get_metrics_history():
+    history_file = f"{MODEL_PATH}/metrics_history.json"
+    if not os.path.exists(history_file):
+        # Fallback: if no history yet, return current metrics as a single-item list
+        m = _load_metrics()
+        return [m] if m else []
+    try:
+        with open(history_file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
 @app.get("/stats")
