@@ -30,3 +30,6 @@ airflow/logs/
 
 # Claude Skills
 docs/superpowers
+
+# report
+report

@@ -9,10 +9,11 @@ Endpoints:
   GET  /users?limit=100                     — sample of indexed users
   GET  /users/{user_id}/profile             — user bias, avg rating, rec count
   GET  /metrics                             — last model RMSE + params
+  GET  /metrics/history                     — all training runs
   GET  /stats                               — aggregate counts
   GET  /products/{product_id}               — product display name
   GET  /dataset/ratings                     — rating distribution for EDA panel
-  GET  /feed                                — SSE live Kafka event stream
+  GET  /feed/latest?after=<ts_ms>           — poll ring buffer (replaces SSE)
 """
 
 import asyncio
@@ -20,15 +21,15 @@ import glob
 import json
 import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
-from typing import AsyncIterator, List, Optional
+from typing import List, Optional
 
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as pg_pool
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 DB_URL     = os.getenv("DB_URL", "postgresql://bigdata:bigdata@postgres/recommendations")
@@ -66,12 +67,59 @@ def get_conn():
         get_pool().putconn(conn)
 
 
+# ── Feed ring buffer ──────────────────────────────────────────────────────────
+
+_feed_buffer: deque = deque(maxlen=200)   # last 200 Kafka events, in memory only
+
+
+async def _kafka_feed_task():
+    """Background task: consume Kafka topic, fill ring buffer. Retries on error."""
+    while True:
+        consumer = None
+        try:
+            from kafka import KafkaConsumer
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC,
+                bootstrap_servers  = KAFKA_BOOTSTRAP,
+                auto_offset_reset  = "latest",
+                enable_auto_commit = False,
+                value_deserializer = lambda b: json.loads(b.decode("utf-8")),
+            )
+            loop = asyncio.get_event_loop()
+            while True:
+                records = await loop.run_in_executor(
+                    None, lambda: consumer.poll(timeout_ms=1000, max_records=10)
+                )
+                for _tp, msgs in records.items():
+                    for msg in msgs:
+                        _feed_buffer.append({
+                            "user_id":    msg.value.get("UserId"),
+                            "product_id": msg.value.get("ProductId"),
+                            "score":      msg.value.get("Score"),
+                            "summary":    msg.value.get("Summary", ""),
+                            "ts":         msg.timestamp,
+                        })
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[feed] Kafka consumer error: {e} — retrying in 5s")
+            await asyncio.sleep(5)
+        finally:
+            if consumer:
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+
+
 # ── App lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_pool()
+    task = asyncio.create_task(_kafka_feed_task())
     yield
+    task.cancel()
     if _pool:
         _pool.closeall()
 
@@ -429,51 +477,12 @@ def dataset_ratings():
     }
 
 
-@app.get("/feed")
-async def live_feed():
-    """Server-Sent Events stream of live Kafka messages."""
-    async def event_stream() -> AsyncIterator[str]:
-        try:
-            from kafka import KafkaConsumer
-            consumer = KafkaConsumer(
-                KAFKA_TOPIC,
-                bootstrap_servers   = KAFKA_BOOTSTRAP,
-                auto_offset_reset   = "latest",
-                enable_auto_commit  = False,
-                value_deserializer  = lambda b: json.loads(b.decode("utf-8")),
-            )
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            return
-
-        loop = asyncio.get_event_loop()
-        try:
-            while True:
-                # Run blocking poll in thread so event loop stays free
-                records = await loop.run_in_executor(
-                    None, lambda: consumer.poll(timeout_ms=1000, max_records=3)
-                )
-                for _tp, msgs in records.items():
-                    for msg in msgs:
-                        payload = {
-                            "user_id":    msg.value.get("UserId"),
-                            "product_id": msg.value.get("ProductId"),
-                            "score":      msg.value.get("Score"),
-                            "summary":    msg.value.get("Summary", ""),
-                            "ts":         msg.timestamp,
-                        }
-                        yield f"data: {json.dumps(payload)}\n\n"
-                        await asyncio.sleep(1.0)   # max 1 event/second per client
-                yield ": heartbeat\n\n"
-                # no extra sleep — run_in_executor already waited up to 1 s
-        finally:
-            consumer.close()
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+@app.get("/feed/latest")
+def feed_latest(after: int = Query(default=0)):
+    """
+    Return events from the in-memory ring buffer newer than `after` (Unix ms timestamp).
+    Frontend polls this every 2 seconds instead of holding a persistent SSE connection.
+    Eliminates Chrome OOM caused by SSE response buffering.
+    """
+    events = [e for e in _feed_buffer if e["ts"] > after]
+    return {"events": events}

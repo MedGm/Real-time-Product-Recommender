@@ -1233,63 +1233,38 @@
       box-shadow: var(--shadow-sm);
     }
 
-    .kpi-card::after {
-      content: attr(data-icon);
-      position: absolute;
-      right: 14px;
-      top: 14px;
-      font-size: 22px;
-      opacity: .18;
-    }
-
     .kpi-accent {
       position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
+      top: 0; left: 0; right: 0;
       height: 3px;
       border-radius: var(--radius) var(--radius) 0 0;
     }
-
-    .kpi-accent.amber {
-      background: linear-gradient(90deg, var(--amber), #f59e0b);
-    }
-
-    .kpi-accent.teal {
-      background: linear-gradient(90deg, var(--teal), #2dd4bf);
-    }
-
-    .kpi-accent.green {
-      background: linear-gradient(90deg, var(--green), #34d399);
-    }
-
-    .kpi-accent.purple {
-      background: linear-gradient(90deg, var(--purple), #a78bfa);
-    }
+    .kpi-accent.amber  { background: var(--amber); }
+    .kpi-accent.teal   { background: var(--teal); }
+    .kpi-accent.green  { background: var(--green); }
+    .kpi-accent.purple { background: var(--purple); }
 
     .kpi-value {
-      font-size: 28px;
-      font-weight: 800;
+      font-size: 24px;
+      font-weight: 700;
       line-height: 1;
-      letter-spacing: -1px;
+      letter-spacing: -.5px;
       color: var(--text);
       margin-bottom: 4px;
-      margin-top: 6px;
+      margin-top: 8px;
     }
 
     .kpi-value small {
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 400;
       color: var(--text3);
       letter-spacing: 0;
     }
 
     .kpi-label {
-      font-size: 10px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: .6px;
-      color: var(--text3);
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--text2);
     }
 
     .analytics-section {
@@ -1894,7 +1869,8 @@
     /* ████  STATE  ████ */
     const S = {
       users: [], metrics: null, stats: null, feedEvents: [],
-      feedESS: null, refreshTimer: null, globalMean: 4.18,
+      feedTimer: null, refreshTimer: null, globalMean: 4.18,
+      feedLastTs: 0, feedMsgCount: 0,
     };
 
     const MAX_FEED_CARDS = 30;
@@ -1917,7 +1893,7 @@
       document.getElementById('page-' + id).classList.add('active');
       const nav = document.getElementById('nav-' + id);
       if (nav) nav.classList.add('active');
-      if (id !== 'feed') stopFeed();   // kill SSE when leaving feed tab
+      if (id !== 'feed') stopFeed();   // stop polling when leaving feed tab
       if (id === 'feed') initFeed();
       if (id === 'analytics') renderAnalytics();
       if (id === 'dataset') renderDataset();
@@ -1998,132 +1974,126 @@
       }
     }
 
-    /* ████  LIVE FEED  ████ */
+    /* ████  LIVE FEED — polling (no SSE, no Chrome OOM)  ████ */
+
     function stopFeed() {
-      if (S.feedESS) {
-        S.feedESS.close();
-        S.feedESS = null;
+      if (S.feedTimer) { clearInterval(S.feedTimer); S.feedTimer = null; }
+    }
+
+    function addFeedCard(list, data) {
+      const productName = productCache.get(data.product_id) || data.summary || data.product_id;
+
+      const card  = document.createElement('div');
+      card.className = 'feed-card';
+
+      const score = document.createElement('div');
+      score.className = 'feed-score';
+      score.textContent = data.score ?? '?';
+
+      const body  = document.createElement('div');
+      body.className = 'feed-body';
+
+      const user  = document.createElement('div');
+      user.className = 'feed-user';
+      user.textContent = data.user_id;
+
+      const prod  = document.createElement('div');
+      prod.className = 'feed-product';
+      prod.textContent = productName;
+
+      const meta  = document.createElement('div');
+      meta.className = 'feed-meta';
+      meta.textContent = `${data.product_id} · ${timeAgo(data.ts)}`;
+
+      body.append(user, prod, meta);
+      card.append(score, body);
+
+      if (list.querySelector('.feed-empty')) list.innerHTML = '';
+      list.insertBefore(card, list.firstChild);
+
+      while (list.children.length > MAX_FEED_CARDS) {
+        const old = list.lastChild;
+        old.classList.add('fading');
+        setTimeout(() => old.remove(), 300);
+      }
+
+      // Eagerly kick off product name fetch — populates cache for future cards
+      if (!productCache.has(data.product_id)) {
+        getProductName(data.product_id).then(name => {
+          // Update any existing cards for this product
+          list.querySelectorAll('.feed-product').forEach(el => {
+            if (el.textContent === data.product_id || el.textContent === data.summary) {
+              el.textContent = name;
+            }
+          });
+        }).catch(() => {});
+      }
+    }
+
+    async function pollFeed() {
+      const list = document.getElementById('feed-list');
+      if (!list) return;
+      try {
+        const res = await apiFetch('/feed/latest', { after: S.feedLastTs });
+        const events = res.events || [];
+        if (events.length === 0) {
+          // No new events — update idle message if still showing placeholder
+          if (S.feedMsgCount === 0 && list.querySelector('.feed-empty')) {
+            apiFetch('/health/all').then(h => {
+              const kc  = h.components?.find(c => c.name === 'kafka');
+              const cnt = kc ? kc.detail.split(' ')[0] : '?';
+              const pulse = document.getElementById('pulse-kafka');
+              if (pulse) pulse.textContent = cnt;
+              const empty = list.querySelector('.feed-empty');
+              if (!empty) return;
+              empty.textContent = (cnt === '0' || cnt === '?')
+                ? 'Topic empty — trigger the DAG to start ingestion.'
+                : `Ingestion complete — ${cnt} messages in topic. Waiting for next DAG run…`;
+            }).catch(() => {});
+          }
+          return;
+        }
+        // Sort ascending so oldest card goes in first, newest ends up on top
+        events.sort((a, b) => a.ts - b.ts);
+        for (const ev of events) {
+          if (!ev.user_id) continue;
+          addFeedCard(list, ev);
+          S.feedMsgCount++;
+          if (ev.ts > S.feedLastTs) S.feedLastTs = ev.ts;
+        }
+        const pulse = document.getElementById('pulse-kafka');
+        if (pulse) pulse.textContent = fmt(S.feedMsgCount);
+      } catch (e) {
+        // API unreachable — show once, keep retrying silently
+        if (S.feedMsgCount === 0) {
+          const empty = list.querySelector('.feed-empty');
+          if (empty) empty.textContent = 'Could not reach API — retrying…';
+        }
       }
     }
 
     function initFeed() {
-      if (S.feedESS) return;  // already connected
+      if (S.feedTimer) return;  // already polling
 
-      const list = document.getElementById('feed-list');
-      // Reset placeholder so onopen can update it
-      if (!list.querySelector('.feed-empty')) {
-        const ph = document.createElement('div');
-        ph.className = 'feed-empty';
-        ph.innerHTML = '<div class="spinner" style="margin:0 auto 12px"></div>Connecting to Kafka stream…';
-        list.prepend(ph);
-      }
-
-      let sessionMsgCount = 0;
-      let idleTimer = null;
-
-      function showIdleState() {
-        // Only show idle if still no messages arrived
-        if (sessionMsgCount > 0) return;
-        apiFetch('/health/all').then(h => {
-          const kc = h.components?.find(c => c.name === 'kafka');
-          const cnt = kc ? kc.detail.split(' ')[0] : '?';
-          // Update pulse stat
+      // Show Kafka message count once
+      apiFetch('/health/all').then(h => {
+        const kc = h.components?.find(c => c.name === 'kafka');
+        if (kc) {
+          const cnt = kc.detail.split(' ')[0];
           const pulse = document.getElementById('pulse-kafka');
           if (pulse) pulse.textContent = cnt;
-          // Update placeholder
-          const empty = list.querySelector('.feed-empty');
-          if (!empty) return;
-          if (cnt === '0' || cnt === '?') {
-            empty.textContent = 'Topic empty — trigger the DAG to start ingestion.';
-          } else {
-            empty.textContent = `Ingestion complete — ${cnt} messages in topic. Waiting for next DAG run…`;
-          }
-        }).catch(() => {
-          const empty = list.querySelector('.feed-empty');
-          if (empty) empty.textContent = 'Connected — Kafka topic idle.';
-        });
-      }
+        }
+      }).catch(() => {});
 
-      try {
-        S.feedESS = new EventSource(API + '/feed');
+      // Reset state when entering feed tab
+      S.feedLastTs    = 0;
+      S.feedMsgCount  = 0;
 
-        S.feedESS.onopen = () => {
-          const empty = list.querySelector('.feed-empty');
-          if (empty) empty.textContent = 'Connected — waiting for Kafka events…';
-          // If no messages arrive in 5 s, show idle state
-          idleTimer = setTimeout(showIdleState, 5000);
-        };
-
-        S.feedESS.onmessage = async (e) => {
-          // Discard if user navigated away while async was in flight
-          if (!S.feedESS) return;
-
-          const data = JSON.parse(e.data);
-          if (data.error || !data.user_id) return;
-
-          // Cancel idle timer — events are flowing
-          if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-          sessionMsgCount++;
-
-          const productName = await getProductName(data.product_id);
-          if (!S.feedESS) return;  // check again after await
-
-          // display_name from DB if available, else summary from Kafka, else raw ID
-          const nameToShow = (productName !== data.product_id)
-            ? productName
-            : (data.summary || data.product_id);
-
-          // Build card with createElement (XSS-safe)
-          const card = document.createElement('div');
-          card.className = 'feed-card';
-
-          const score = document.createElement('div');
-          score.className = 'feed-score';
-          score.textContent = data.score ?? '?';
-
-          const body = document.createElement('div');
-          body.className = 'feed-body';
-
-          const user = document.createElement('div');
-          user.className = 'feed-user';
-          user.textContent = data.user_id;
-
-          const prod = document.createElement('div');
-          prod.className = 'feed-product';
-          prod.textContent = nameToShow;
-
-          const meta = document.createElement('div');
-          meta.className = 'feed-meta';
-          meta.textContent = `${data.product_id} · ${timeAgo(data.ts)}`;
-
-          body.append(user, prod, meta);
-          card.append(score, body);
-
-          if (list.querySelector('.feed-empty')) list.innerHTML = '';
-          list.insertBefore(card, list.firstChild);
-
-          while (list.children.length > MAX_FEED_CARDS) {
-            const old = list.lastChild;
-            old.classList.add('fading');
-            setTimeout(() => old.remove(), 300);
-          }
-        };
-
-        S.feedESS.onerror = () => {
-          if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-          stopFeed();
-          const el = document.getElementById('feed-list');
-          if (el) el.innerHTML = '<div class="feed-empty">Stream disconnected — reconnect by returning to this tab.</div>';
-        };
-      } catch (e) {
-        const msg = document.createElement('div');
-        msg.className = 'feed-empty';
-        msg.textContent = e.message;
-        list.replaceChildren(msg);
-      }
+      pollFeed();  // immediate first poll
+      S.feedTimer = setInterval(pollFeed, 2000);  // then every 2s
     }
 
-    // Disconnect when tab goes hidden, reconnect when visible again on feed page
+    // Stop polling when tab hidden — no wasted requests while invisible
     document.addEventListener('visibilitychange', () => {
       const onFeed = document.getElementById('page-feed')?.classList.contains('active');
       if (document.hidden) {
@@ -2359,22 +2329,22 @@
 
     <!-- KPI Strip -->
     <div class="kpi-strip">
-      <div class="kpi-card" data-icon="📉">
+      <div class="kpi-card">
         <div class="kpi-accent amber"></div>
         <div class="kpi-label">Validation RMSE</div>
         <div class="kpi-value">${m.val_rmse.toFixed(4)} <small>10% split</small></div>
       </div>
-      <div class="kpi-card" data-icon="🎯">
+      <div class="kpi-card">
         <div class="kpi-accent teal"></div>
-        <div class="kpi-label">Test RMSE (held-out)</div>
+        <div class="kpi-label">Test RMSE — held-out</div>
         <div class="kpi-value">${m.test_rmse.toFixed(4)} <small>10% split</small></div>
       </div>
-      <div class="kpi-card" data-icon="👤">
+      <div class="kpi-card">
         <div class="kpi-accent green"></div>
         <div class="kpi-label">Unique Users</div>
         <div class="kpi-value">${fmt(m.unique_users)}</div>
       </div>
-      <div class="kpi-card" data-icon="📦">
+      <div class="kpi-card">
         <div class="kpi-accent purple"></div>
         <div class="kpi-label">Unique Products</div>
         <div class="kpi-value">${fmt(m.unique_products)}</div>
@@ -2422,11 +2392,11 @@
       rmseChart = new Chart(document.getElementById('rmse-chart'), {
         type: 'bar',
         data: {
-          labels: ['Baseline (mean)', 'Raw ALS', 'ALS + Bias (this model)'],
+          labels: ['Global Mean Baseline', 'Raw ALS', 'ALS + Bias Decomp.'],
           datasets: [{
             data: [1.55, 1.03, m.test_rmse],
-            backgroundColor: ['rgba(71,85,105,.6)', 'rgba(59,130,246,.6)', 'rgba(20,184,166,.8)'],
-            borderColor: ['#475569', '#3b82f6', '#14b8a6'],
+            backgroundColor: ['#E5E7EB', '#BFDBFE', '#4F46E5'],
+            borderColor:     ['#D1D5DB', '#93C5FD', '#3730A3'],
             borderWidth: 1, borderRadius: 4,
           }],
         },
@@ -2435,12 +2405,13 @@
           plugins: { legend: { display: false } },
           scales: {
             y: {
-              beginAtZero: false, min: 0.4, grid: { color: 'rgba(255,255,255,.04)' },
-              ticks: { color: '#94a3b8', font: { family: 'Space Mono', size: 10 } }
+              beginAtZero: false, min: 0.4,
+              grid: { color: '#F3F4F6' },
+              ticks: { color: '#6B7280', font: { family: 'Inter, system-ui', size: 11 } }
             },
             x: {
               grid: { display: false },
-              ticks: { color: '#94a3b8', font: { family: 'Space Mono', size: 10 } }
+              ticks: { color: '#6B7280', font: { family: 'Inter, system-ui', size: 11 } }
             },
           },
         },
@@ -2451,11 +2422,11 @@
         type: 'doughnut',
         data: {
           labels: ['Training (80%)', 'Validation (10%)', 'Test held-out (10%)'],
-          datasets: [{ data: [80, 10, 10], backgroundColor: ['rgba(245,158,11,.8)', 'rgba(20,184,166,.8)', 'rgba(139,92,246,.8)'], borderWidth: 0 }],
+          datasets: [{ data: [80, 10, 10], backgroundColor: ['#4F46E5', '#0D9488', '#D97706'], borderWidth: 0 }],
         },
         options: {
-          responsive: true, cutout: '65%',
-          plugins: { legend: { position: 'bottom', labels: { color: '#94a3b8', font: { size: 11 }, padding: 12 } } },
+          responsive: true, cutout: '68%',
+          plugins: { legend: { position: 'bottom', labels: { color: '#6B7280', font: { size: 11, family: 'Inter, system-ui' }, padding: 14 } } },
         },
       });
     }

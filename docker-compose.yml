@@ -6,6 +6,7 @@ volumes:
   postgres_data:
   spark_model:
   airflow_logs:
+  ivy_cache:
 
 services:
 
@@ -218,6 +219,7 @@ services:
       - ./producer:/producer:ro                     # producer.py run as DAG task
       - ./dataset:/dataset:ro                       # Reviews.csv for producer task
       - spark_model:/model
+      - ivy_cache:/root/.ivy2                       # cache Maven JARs across runs
     ports:
       - "8080:8080"
     command: >-
