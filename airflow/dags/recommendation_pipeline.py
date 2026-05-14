@@ -51,6 +51,7 @@ SPARK_SUBMIT_TRAIN = (
     f"--conf spark.driver.memory=4g "
     f"--conf spark.driver.maxResultSize=2g "
     f"--conf spark.sql.adaptive.enabled=true "
+    f"--conf spark.ui.port=4040 "
 )
 
 DEFAULT_ARGS = {

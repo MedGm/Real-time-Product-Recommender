@@ -267,7 +267,9 @@ Pipeline starts automatically. No manual Airflow trigger required. Total time: *
 | Dashboard | http://localhost:8501 | — |
 | Airflow | http://localhost:8080 | `airflow` / `airflow` |
 | FastAPI docs | http://localhost:8000/docs | — |
-| Spark UI | http://localhost:8090 | — |
+| Spark cluster UI | http://localhost:8090 | — |
+| Spark streaming UI | http://localhost:4040 | — (live after model ready) |
+| Spark training UI | http://localhost:4041 | — (active only during Task 2) |
 | PostgreSQL | localhost:5433 | `bigdata` / `bigdata` |
 
 ### Useful commands
