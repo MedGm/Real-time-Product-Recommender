@@ -130,12 +130,15 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    ports:
+      - "4040:4040"    # Spark Structured Streaming UI
     command: >-
       bash -c "until [ -f /model/metrics.json ]; do echo 'Waiting for model...'; sleep 10; done &&
       /opt/spark/bin/spark-submit --master local[2]
       --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.postgresql:postgresql:42.7.3
       --conf spark.sql.shuffle.partitions=10
       --conf spark.sql.streaming.kafka.useDeprecatedOffsetFetching=false
+      --conf spark.ui.port=4040
       /jobs/stream.py"
     environment:
       KAFKA_BOOTSTRAP: kafka:29092
@@ -222,6 +225,7 @@ services:
       - ivy_cache:/root/.ivy2                       # cache Maven JARs across runs
     ports:
       - "8080:8080"
+      - "4041:4040"    # Spark training UI (active only during Task 2)
     command: >-
       bash -c "
         airflow db migrate &&
