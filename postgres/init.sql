@@ -29,6 +29,21 @@ CREATE TABLE IF NOT EXISTS products (
 );
 
 -- ─────────────────────────────────────────────────────────────
+-- Bias tables — populated by train.py after each training run
+-- Enables real score breakdown in the dashboard
+-- ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS user_biases (
+    user_id   TEXT PRIMARY KEY,
+    user_bias FLOAT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS item_biases (
+    product_id TEXT PRIMARY KEY,
+    item_bias  FLOAT NOT NULL
+);
+
+-- ─────────────────────────────────────────────────────────────
 -- Model training runs — stores metrics history
 -- ─────────────────────────────────────────────────────────────
 

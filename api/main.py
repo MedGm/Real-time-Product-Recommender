@@ -70,10 +70,12 @@ def get_conn():
 # ── Feed ring buffer ──────────────────────────────────────────────────────────
 
 _feed_buffer: deque = deque(maxlen=200)   # last 200 Kafka events, in memory only
+_feed_seq:    int   = 0                   # monotonic counter — never resets
 
 
 async def _kafka_feed_task():
     """Background task: consume Kafka topic, fill ring buffer. Retries on error."""
+    global _feed_seq
     while True:
         consumer = None
         try:
@@ -92,7 +94,9 @@ async def _kafka_feed_task():
                 )
                 for _tp, msgs in records.items():
                     for msg in msgs:
+                        _feed_seq += 1
                         _feed_buffer.append({
+                            "seq":        _feed_seq,          # unique — never collides
                             "user_id":    msg.value.get("UserId"),
                             "product_id": msg.value.get("ProductId"),
                             "score":      msg.value.get("Score"),
@@ -146,11 +150,14 @@ class RecommendationItem(BaseModel):
     product_id:       str
     display_name:     Optional[str] = None
     predicted_rating: Optional[float] = None
+    item_bias:        Optional[float] = None
+    als_residual:     Optional[float] = None
 
 
 class RecommendationResponse(BaseModel):
     user_id:         str
     is_cold_start:   bool
+    user_bias:       Optional[float] = None
     recommendations: List[RecommendationItem]
 
 
@@ -206,6 +213,14 @@ def _load_metrics() -> Optional[dict]:
         return None
 
 
+def _load_popular_products() -> List[str]:
+    try:
+        with open(f"{MODEL_PATH}/popular_products.json") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
 def _lookup_product_names(product_ids: List[str]) -> dict:
     if not product_ids:
         return {}
@@ -249,7 +264,11 @@ def health_all():
         consumer   = KafkaConsumer(bootstrap_servers=KAFKA_BOOTSTRAP)
         partitions = consumer.partitions_for_topic(KAFKA_TOPIC) or set()
         tps        = [TopicPartition(KAFKA_TOPIC, p) for p in partitions]
-        total      = sum(consumer.end_offsets(tps).values()) if tps else 0
+        # end_offset - beginning_offset = actual consumable messages
+        # (delete-records advances beginning offset, raw end_offset is absolute)
+        end_offs   = consumer.end_offsets(tps) if tps else {}
+        begin_offs = consumer.beginning_offsets(tps) if tps else {}
+        total      = sum(end_offs[tp] - begin_offs[tp] for tp in tps)
         consumer.close()
         components.append(ComponentHealth(
             name="kafka", status="healthy",
@@ -325,36 +344,70 @@ def get_recommendations(
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
                 """
-                SELECT product_id, predicted_rating, rank
-                FROM   recommendations
-                WHERE  user_id = %s
-                ORDER  BY rank
+                SELECT r.product_id, r.predicted_rating, r.rank,
+                       ib.item_bias
+                FROM   recommendations r
+                LEFT JOIN item_biases ib ON ib.product_id = r.product_id
+                WHERE  r.user_id = %s
+                ORDER  BY r.rank
                 LIMIT  %s
                 """,
                 (user_id, n),
             )
             rows = cur.fetchall()
 
+            cur.execute(
+                "SELECT user_bias FROM user_biases WHERE user_id = %s",
+                (user_id,),
+            )
+            ub_row = cur.fetchone()
+
     if not rows:
-        raise HTTPException(status_code=404, detail=f"No recommendations for user '{user_id}'.")
+        # Unknown user — serve popular products live, no DB write needed
+        popular     = _load_popular_products()[:n]
+        name_map    = _lookup_product_names(popular)
+        items       = [
+            RecommendationItem(
+                rank             = i + 1,
+                product_id       = pid,
+                display_name     = name_map.get(pid),
+                predicted_rating = None,
+            )
+            for i, pid in enumerate(popular)
+        ]
+        return RecommendationResponse(
+            user_id         = user_id,
+            is_cold_start   = True,
+            user_bias       = None,
+            recommendations = items,
+        )
 
     is_cold_start = all(r["predicted_rating"] is None for r in rows)
     product_ids   = [r["product_id"] for r in rows]
     name_map      = _lookup_product_names(product_ids)
+    user_bias     = round(ub_row["user_bias"], 4) if ub_row else None
+    global_mean   = _load_metrics().get("global_mean", 0.0) if _load_metrics() else 0.0
 
-    items = [
-        RecommendationItem(
+    items = []
+    for r in rows:
+        pr = round(min(5.0, max(1.0, r["predicted_rating"])), 3) if r["predicted_rating"] else None
+        ib = round(r["item_bias"], 4) if r["item_bias"] is not None else None
+        als = None
+        if pr is not None and user_bias is not None and ib is not None:
+            als = round(pr - global_mean - user_bias - ib, 4)
+        items.append(RecommendationItem(
             rank             = r["rank"],
             product_id       = r["product_id"],
             display_name     = name_map.get(r["product_id"]),
-            predicted_rating = round(r["predicted_rating"], 3) if r["predicted_rating"] else None,
-        )
-        for r in rows
-    ]
+            predicted_rating = pr,
+            item_bias        = ib,
+            als_residual     = als,
+        ))
 
     return RecommendationResponse(
         user_id         = user_id,
         is_cold_start   = is_cold_start,
+        user_bias       = user_bias,
         recommendations = items,
     )
 
@@ -364,7 +417,13 @@ def list_users(limit: int = Query(default=100, ge=1, le=1000)):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT DISTINCT user_id FROM recommendations LIMIT %s",
+                """
+                SELECT user_id FROM recommendations
+                WHERE predicted_rating IS NOT NULL
+                GROUP BY user_id
+                ORDER BY RANDOM()
+                LIMIT %s
+                """,
                 (limit,),
             )
             rows = cur.fetchall()
@@ -449,11 +508,20 @@ def get_metrics_history():
 def get_stats():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(DISTINCT user_id), COUNT(*) FROM recommendations")
-            users, total = cur.fetchone()
+            cur.execute("""
+                SELECT
+                    COUNT(DISTINCT CASE WHEN predicted_rating IS NOT NULL THEN user_id END),
+                    COUNT(DISTINCT CASE WHEN predicted_rating IS NULL     THEN user_id END),
+                    COUNT(DISTINCT user_id),
+                    COUNT(*)
+                FROM recommendations
+            """)
+            personalized, cold_start, total_users, total_recs = cur.fetchone()
     return {
-        "users_with_recommendations": users,
-        "total_recommendation_rows":  total,
+        "users_with_recommendations": total_users,
+        "personalized_users":         personalized,
+        "cold_start_users":           cold_start,
+        "total_recommendation_rows":  total_recs,
     }
 
 
@@ -480,9 +548,8 @@ def dataset_ratings():
 @app.get("/feed/latest")
 def feed_latest(after: int = Query(default=0)):
     """
-    Return events from the in-memory ring buffer newer than `after` (Unix ms timestamp).
-    Frontend polls this every 2 seconds instead of holding a persistent SSE connection.
-    Eliminates Chrome OOM caused by SSE response buffering.
+    Return at most 10 newest events with seq > after.
+    Sequence numbers are unique integers — no timestamp collision risk.
     """
-    events = [e for e in _feed_buffer if e["ts"] > after]
-    return {"events": events}
+    events = [e for e in _feed_buffer if e["seq"] > after]
+    return {"events": events[-10:]}

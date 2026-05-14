@@ -47,7 +47,8 @@ from pyspark.ml.feature import StringIndexer
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, coalesce, count, desc, first, from_json, lit, mean, posexplode
+from pyspark.sql.functions import col, coalesce, count, desc, first, from_json, greatest, least, length, lit, mean, posexplode, row_number, when
+from pyspark.sql.window import Window
 from pyspark.sql.types import FloatType, LongType, StringType, StructField, StructType
 
 # ── Kafka config ──────────────────────────────────────────────────────────────
@@ -247,9 +248,11 @@ def write_all_recommendations(spark: SparkSession, best_model, encoder,
             col("raw_user").alias("user_id"),
             col("raw_product").alias("product_id"),
             col("rank"),
-            (col("residual") + lit(global_mean)
-             + coalesce(col("user_bias"), lit(0.0))
-             + coalesce(col("item_bias"), lit(0.0))).alias("predicted_rating"),
+            least(lit(5.0), greatest(lit(1.0),
+                col("residual") + lit(global_mean)
+                + coalesce(col("user_bias"), lit(0.0))
+                + coalesce(col("item_bias"), lit(0.0))
+            )).alias("predicted_rating"),
         )
     )
 
@@ -284,8 +287,9 @@ def write_all_recommendations(spark: SparkSession, best_model, encoder,
 
 def save_product_names(spark: SparkSession):
     """
-    Read Reviews.csv, extract a display name per product (most-helpful review
-    Summary), and upsert into the postgres products table for the dashboard.
+    Read Reviews.csv, extract a display name per product using the most-helpful
+    review summary (highest HelpfulnessNumerator/Denominator ratio, tie-broken
+    by longest summary text for descriptiveness). Upsert into postgres products.
     """
     if not os.path.exists(CSV_PATH):
         print(f"[train] CSV not found at {CSV_PATH}, skipping product names.")
@@ -300,17 +304,37 @@ def save_product_names(spark: SparkSession):
         .select(
             col("ProductId").alias("product_id"),
             col("Summary").alias("summary"),
+            col("HelpfulnessNumerator").cast("int").alias("h_num"),
+            col("HelpfulnessDenominator").cast("int").alias("h_den"),
         )
         .dropna(subset=["product_id", "summary"])
         .filter(col("summary") != "")
+        .withColumn(
+            "h_ratio",
+            when(col("h_den") > 0, col("h_num") / col("h_den")).otherwise(0.0),
+        )
+    )
+
+    # Pick per product: highest helpfulness ratio, then longest summary
+    w = Window.partitionBy("product_id").orderBy(
+        desc("h_ratio"), desc("h_num"), desc(length("summary"))
+    )
+    best = (
+        csv_df
+        .withColumn("rn", row_number().over(w))
+        .filter(col("rn") == 1)
+        .select("product_id", "summary")
     )
 
     products_df = (
         csv_df
         .groupBy("product_id")
-        .agg(
-            count("*").alias("review_count"),
-            first("summary").alias("display_name"),
+        .agg(count("*").alias("review_count"))
+        .join(best, on="product_id", how="left")
+        .select(
+            col("product_id"),
+            col("summary").alias("display_name"),
+            col("review_count"),
         )
     )
 
@@ -478,6 +502,41 @@ def train(spark: SparkSession):
     test_df.write.mode("overwrite").parquet(f"{MODEL_PATH}/test_data")
     user_biases.write.mode("overwrite").parquet(f"{MODEL_PATH}/user_biases")
     item_biases.write.mode("overwrite").parquet(f"{MODEL_PATH}/item_biases")
+
+    # Write biases to postgres (string keys) for API score breakdown
+    user_labels    = encoder.stages[0].labels
+    product_labels = encoder.stages[1].labels
+    user_map_df    = spark.createDataFrame(
+        [(i, user_labels[i])    for i in range(len(user_labels))], ["userId",    "user_id"])
+    product_map_df = spark.createDataFrame(
+        [(i, product_labels[i]) for i in range(len(product_labels))], ["productId", "product_id"])
+
+    ub_str = user_biases.join(user_map_df,    on="userId",    how="left").select("user_id",    "user_bias")
+    ib_str = item_biases.join(product_map_df, on="productId", how="left").select("product_id", "item_bias")
+
+    ub_str.write.jdbc(url=JDBC_URL, table="user_biases_stg",  mode="overwrite", properties=JDBC_PROP)
+    ib_str.write.jdbc(url=JDBC_URL, table="item_biases_stg",  mode="overwrite", properties=JDBC_PROP)
+
+    try:
+        conn_b = psycopg2.connect(host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB, user=_PG_USER, password=_PG_PASS)
+        with conn_b:
+            with conn_b.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO user_biases (user_id, user_bias)
+                    SELECT user_id, user_bias FROM user_biases_stg
+                    ON CONFLICT (user_id) DO UPDATE SET user_bias = EXCLUDED.user_bias
+                """)
+                cur.execute("DROP TABLE IF EXISTS user_biases_stg")
+                cur.execute("""
+                    INSERT INTO item_biases (product_id, item_bias)
+                    SELECT product_id, item_bias FROM item_biases_stg
+                    ON CONFLICT (product_id) DO UPDATE SET item_bias = EXCLUDED.item_bias
+                """)
+                cur.execute("DROP TABLE IF EXISTS item_biases_stg")
+        conn_b.close()
+        print("[train] Biases written to postgres.")
+    except Exception as exc:
+        print(f"[train] Warning: could not write biases to postgres: {exc}")
 
     metrics = {
         "val_rmse":        best_rmse,

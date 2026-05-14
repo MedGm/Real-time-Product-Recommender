@@ -47,14 +47,15 @@ SPARK_SUBMIT_TRAIN = (
     f"/opt/spark/bin/spark-submit "
     f"--master local[*] "
     f"--packages {SPARK_PACKAGES} "
-    f"--conf spark.sql.shuffle.partitions=50 "
-    f"--conf spark.driver.memory=2g "
+    f"--conf spark.sql.shuffle.partitions=20 "
+    f"--conf spark.driver.memory=4g "
+    f"--conf spark.driver.maxResultSize=2g "
+    f"--conf spark.sql.adaptive.enabled=true "
 )
 
 DEFAULT_ARGS = {
     "owner":            "bigdata",
-    "retries":          1,
-    "retry_delay":      timedelta(minutes=5),
+    "retries":          0,
     "email_on_failure": False,
 }
 
@@ -106,7 +107,7 @@ with DAG(
             "KAFKA_BOOTSTRAP": KAFKA_BOOT,
             "KAFKA_TOPIC":     KAFKA_TOPIC,
             "CSV_PATH":        "/dataset/Reviews.csv",
-            "MAX_ROWS":        "200000",
+            "MAX_ROWS":        "568454",
             "DELAY_MS":        "0",
         },
         append_env        = True,

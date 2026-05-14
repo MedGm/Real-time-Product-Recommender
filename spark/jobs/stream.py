@@ -31,7 +31,7 @@ from psycopg2 import sql as pgsql
 from pyspark.ml import PipelineModel
 from pyspark.ml.recommendation import ALSModel
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import coalesce, col, from_json, lit, posexplode
+from pyspark.sql.functions import coalesce, col, from_json, greatest, least, lit, posexplode
 from pyspark.sql.types import FloatType, LongType, StringType, StructField, StructType
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:29092")
@@ -170,9 +170,11 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
                     col("raw_user").alias("user_id"),
                     col("raw_product").alias("product_id"),
                     col("rank"),
-                    (col("predicted_rating") + lit(global_mean)
-                     + coalesce(col("user_bias"), lit(0.0))
-                     + coalesce(col("item_bias"), lit(0.0))).alias("predicted_rating"),
+                    least(lit(5.0), greatest(lit(1.0),
+                        col("predicted_rating") + lit(global_mean)
+                        + coalesce(col("user_bias"), lit(0.0))
+                        + coalesce(col("item_bias"), lit(0.0))
+                    )).alias("predicted_rating"),
                 )
             )
 
@@ -201,34 +203,11 @@ def make_batch_handler(spark: SparkSession, encoder: PipelineModel, als_model: A
             finally:
                 conn.close()
 
-        # ── Cold-start users: insert popular-product fallbacks ────────────────
-        if coldstart_users and popular_products:
-            conn = psycopg2.connect(
-                host=_PG_HOST, port=int(_PG_PORT), dbname=_PG_DB,
-                user=_PG_USER, password=_PG_PASS
-            )
-            try:
-                with conn:
-                    with conn.cursor() as cur:
-                        for user_id in coldstart_users:
-                            for rank, product_id in enumerate(popular_products, 1):
-                                cur.execute(
-                                    """
-                                    INSERT INTO recommendations
-                                        (user_id, product_id, rank, predicted_rating)
-                                    VALUES (%s, %s, %s, NULL)
-                                    ON CONFLICT (user_id, product_id) DO NOTHING
-                                    """,
-                                    (user_id, product_id, rank),
-                                )
-            finally:
-                conn.close()
-            print(f"[stream] Batch {batch_id}: popular-product fallback for "
-                  f"{len(coldstart_users)} cold-start user(s).")
-
-        if known_users or coldstart_users:
+        # Cold-start users are NOT written to postgres.
+        # The API serves popular products live from popular_products.json at query time.
+        if known_users:
             print(f"[stream] Batch {batch_id}: {len(known_users)} known, "
-                  f"{len(coldstart_users)} cold-start.")
+                  f"{len(coldstart_users)} cold-start (skipped — served live by API).")
 
     return write_recommendations
 
