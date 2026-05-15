@@ -3,6 +3,8 @@
 **Big Data Module · Université Abdelmalek Essaâdi**  
 Supervised by **Prof. Yassin El Yusfi**
 
+#### Rapport complet de projet disponible dans `report/` — [PDF version](report/report.pdf)
+
 Amazon Fine Food Reviews (~568k reviews) · ALS collaborative filtering with bias decomposition · End-to-end streaming pipeline
 
 ![Architecture](architecture.png)
