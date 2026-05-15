@@ -233,18 +233,24 @@ def _lookup_product_names(product_ids: List[str]) -> dict:
             return {r[0]: r[1] for r in cur.fetchall()}
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# ── API ENDPOINTS ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── SECTION 1: System Monitoring ──────────────────────────────────────────────
 
 @app.get("/health")
 def health():
+    """Basic liveness probe for load balancer / orchestration."""
     return {"status": "ok"}
 
 
 @app.get("/health/all", response_model=HealthAll)
 def health_all():
+    """Detailed health check of all big data components (Postgres, Kafka, Spark)."""
     components: List[ComponentHealth] = []
 
-    # Postgres
+    # Postgres connectivity
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -257,15 +263,13 @@ def health_all():
     except Exception as e:
         components.append(ComponentHealth(name="postgres", status="offline", detail=str(e)))
 
-    # Kafka
+    # Kafka topic status
     try:
         from kafka import KafkaConsumer
         from kafka.structs import TopicPartition
         consumer   = KafkaConsumer(bootstrap_servers=KAFKA_BOOTSTRAP)
         partitions = consumer.partitions_for_topic(KAFKA_TOPIC) or set()
         tps        = [TopicPartition(KAFKA_TOPIC, p) for p in partitions]
-        # end_offset - beginning_offset = actual consumable messages
-        # (delete-records advances beginning offset, raw end_offset is absolute)
         end_offs   = consumer.end_offsets(tps) if tps else {}
         begin_offs = consumer.beginning_offsets(tps) if tps else {}
         total      = sum(end_offs[tp] - begin_offs[tp] for tp in tps)
@@ -277,7 +281,7 @@ def health_all():
     except Exception as e:
         components.append(ComponentHealth(name="kafka", status="offline", detail=str(e)))
 
-    # Model / Spark training
+    # Batch Training Metrics
     m = _load_metrics()
     if m:
         components.append(ComponentHealth(
@@ -329,6 +333,7 @@ def health_all():
 
 @app.get("/pipeline-status", response_model=PipelineStatus)
 def pipeline_status():
+    """Returns the high-level readiness of the machine learning pipeline."""
     m = _load_metrics()
     if not m:
         return PipelineStatus(model_ready=False)
@@ -344,11 +349,61 @@ def pipeline_status():
     )
 
 
+# ── SECTION 2: User Intelligence ──────────────────────────────────────────────
+
+@app.get("/users")
+def list_users(limit: int = Query(default=100, ge=1, le=1000)):
+    """Returns a random sample of indexed users with pre-calculated recommendations."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_id FROM recommendations
+                WHERE predicted_rating IS NOT NULL
+                GROUP BY user_id
+                ORDER BY RANDOM()
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return {"users": [r[0] for r in rows]}
+
+
+@app.get("/users/{user_id}/profile", response_model=UserProfile)
+def user_profile(user_id: str):
+    """Retrieves metadata and aggregate stats for a specific user profile."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*), AVG(predicted_rating) FROM recommendations WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+
+    if not row or row[0] == 0:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found.")
+
+    rec_count, avg_pred = row
+    return UserProfile(
+        user_id       = user_id,
+        is_known      = avg_pred is not None,
+        rec_count     = rec_count,
+        avg_predicted = round(avg_pred, 3) if avg_pred else None,
+    )
+
+
+# ── SECTION 3: Inference Engine ───────────────────────────────────────────────
+
 @app.get("/recommendations/user/{user_id}", response_model=RecommendationResponse)
 def get_recommendations(
     user_id: str,
     n: int = Query(default=10, ge=1, le=50),
 ):
+    """
+    Main entry point for serving Top-N recommendations.
+    Includes bias-decomposition metadata for explainable AI.
+    """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
@@ -421,48 +476,9 @@ def get_recommendations(
     )
 
 
-@app.get("/users")
-def list_users(limit: int = Query(default=100, ge=1, le=1000)):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT user_id FROM recommendations
-                WHERE predicted_rating IS NOT NULL
-                GROUP BY user_id
-                ORDER BY RANDOM()
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-    return {"users": [r[0] for r in rows]}
-
-
-@app.get("/users/{user_id}/profile", response_model=UserProfile)
-def user_profile(user_id: str):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*), AVG(predicted_rating) FROM recommendations WHERE user_id = %s",
-                (user_id,),
-            )
-            row = cur.fetchone()
-
-    if not row or row[0] == 0:
-        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found.")
-
-    rec_count, avg_pred = row
-    return UserProfile(
-        user_id       = user_id,
-        is_known      = avg_pred is not None,
-        rec_count     = rec_count,
-        avg_predicted = round(avg_pred, 3) if avg_pred else None,
-    )
-
-
 @app.get("/products/{product_id}")
 def get_product(product_id: str):
+    """Fetches a specific product's display name and overall review volume."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -475,8 +491,11 @@ def get_product(product_id: str):
     return {"product_id": product_id, "display_name": row[0], "review_count": row[1]}
 
 
+# ── SECTION 4: Model Analytics ────────────────────────────────────────────────
+
 @app.get("/metrics", response_model=MetricsResponse)
 def get_metrics(timestamp: Optional[str] = None):
+    """Retrieves RMSE and hyperparameter metadata for the current or a specific model run."""
     if timestamp:
         history_file = f"{MODEL_PATH}/metrics_history.json"
         if os.path.exists(history_file):
@@ -501,6 +520,7 @@ def get_metrics(timestamp: Optional[str] = None):
 
 @app.get("/metrics/history")
 def get_metrics_history():
+    """Returns the full history of all successful batch training runs."""
     history_file = f"{MODEL_PATH}/metrics_history.json"
     if not os.path.exists(history_file):
         # Fallback: if no history yet, return current metrics as a single-item list
@@ -515,6 +535,7 @@ def get_metrics_history():
 
 @app.get("/stats")
 def get_stats():
+    """Aggregates high-level counts for the recommendations database."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -536,7 +557,7 @@ def get_stats():
 
 @app.get("/dataset/ratings")
 def dataset_ratings():
-    """Fixed EDA stats from Amazon Fine Food Reviews dataset."""
+    """Static EDA stats for the Amazon Fine Food Reviews dataset."""
     return {
         "distribution": [
             {"stars": 1, "count": 52268,  "pct": 9.2},
@@ -554,11 +575,14 @@ def dataset_ratings():
     }
 
 
+# ── SECTION 5: Real-time Streams ──────────────────────────────────────────────
+
 @app.get("/feed/latest")
 def feed_latest(after: int = Query(default=0)):
     """
-    Return at most 10 newest events with seq > after.
-    Sequence numbers are unique integers — no timestamp collision risk.
+    Returns a window of the newest Kafka events. 
+    Uses sequence-based polling for reliability.
     """
     events = [e for e in _feed_buffer if e["seq"] > after]
     return {"events": events[-10:]}
+
