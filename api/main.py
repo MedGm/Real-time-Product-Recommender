@@ -290,23 +290,32 @@ def health_all():
             detail="metrics.json not found — training not yet complete",
         ))
 
-    # Spark streaming (checkpoint recency)
-    checkpoint = f"{MODEL_PATH}/stream_checkpoint"
+    # Spark streaming — check heartbeat file written after each batch
+    heartbeat_path = f"{MODEL_PATH}/stream_heartbeat.json"
     try:
-        files = glob.glob(f"{checkpoint}/**/*", recursive=True)
-        if files:
-            latest = max(os.path.getmtime(f) for f in files if os.path.isfile(f))
-            age_s  = int(time.time() - latest)
-            status = "healthy" if age_s < 120 else "degraded"
+        if os.path.exists(heartbeat_path):
+            with open(heartbeat_path) as _hbf:
+                hb = json.load(_hbf)
+            age_s  = int(time.time() - hb.get("ts", 0))
+            batch_id = hb.get("batch_id", "?")
+            # Threshold: 5 minutes — accommodates large first batches
+            status = "healthy" if age_s < 300 else "degraded"
             components.append(ComponentHealth(
                 name="spark_streaming", status=status,
-                detail=f"last checkpoint {age_s}s ago",
+                detail=f"batch {batch_id} completed · {age_s}s ago",
             ))
         else:
-            components.append(ComponentHealth(
-                name="spark_streaming", status="degraded",
-                detail="no checkpoint yet",
-            ))
+            # No heartbeat yet — check if model exists (stream waiting for model)
+            if os.path.exists(f"{MODEL_PATH}/metrics.json"):
+                components.append(ComponentHealth(
+                    name="spark_streaming", status="degraded",
+                    detail="model loaded — waiting for first batch to complete",
+                ))
+            else:
+                components.append(ComponentHealth(
+                    name="spark_streaming", status="degraded",
+                    detail="waiting for training to complete",
+                ))
     except Exception as e:
         components.append(ComponentHealth(name="spark_streaming", status="offline", detail=str(e)))
 

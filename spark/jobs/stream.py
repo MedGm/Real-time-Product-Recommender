@@ -221,7 +221,18 @@ def run():
     popular_products                = load_popular_products()
     print(f"[stream] Models loaded. Global mean: {global_mean:.4f}. Starting streaming query...")
 
-    batch_handler = make_batch_handler(spark, encoder, als_model, global_mean, popular_products)
+    _inner_handler = make_batch_handler(spark, encoder, als_model, global_mean, popular_products)
+
+    def batch_handler(batch_df, batch_id):
+        _inner_handler(batch_df, batch_id)
+        # Write heartbeat so health check can confirm streaming is alive
+        hb = {
+            "batch_id":   batch_id,
+            "ts":         __import__("time").time(),
+            "status":     "ok",
+        }
+        with open(f"{MODEL_PATH}/stream_heartbeat.json", "w") as _f:
+            __import__("json").dump(hb, _f)
 
     raw_stream = (
         spark.readStream
